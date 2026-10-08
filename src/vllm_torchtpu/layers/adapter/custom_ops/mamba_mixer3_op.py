@@ -22,20 +22,20 @@ from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import (
     divide,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_mixer2 import Mixer2RMSNormGated
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -178,54 +178,50 @@ class MambaMixer3(MambaBase, PluggableLayer):
         self.cache_config = cache_config
         self.prefix = prefix
 
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.tped_intermediate_size = divide(intermediate_size, self.tp_size)
         self.tped_dt_size = divide(num_heads, self.tp_size)
+        self.tp_n_groups = (
+            divide(n_groups, self.tp_size) if n_groups % self.tp_size == 0 else n_groups
+        )
         self.groups_ssm_state_size = (
             self.mimo_rank * self.n_groups * self.ssm_state_size
         )
+        self.tped_bc_size = self.mimo_rank * self.tp_n_groups * self.ssm_state_size
         self.aux_dim = (
             self.mimo_rank * (self.head_dim + self.ssm_state_size)
             + self.num_rope_angles
         )
+        self.total_proj_size = (
+            2 * intermediate_size
+            + 2 * self.groups_ssm_state_size
+            + 3 * num_heads
+            + self.num_rope_angles
+        )
+        self.local_proj_size = (
+            2 * self.tped_intermediate_size
+            + 2 * self.tped_bc_size
+            + 3 * self.tped_dt_size
+            + self.num_rope_angles
+        )
 
-        if (
-            self.n_groups % self.tp_size == 0
-            and self.num_rope_angles % self.tp_size == 0
-            and self.tp_size == 1
-        ):
-            self.in_proj = MergedColumnParallelLinear(
-                input_size=hidden_size,
-                output_sizes=[
-                    intermediate_size,
-                    intermediate_size,
-                    self.groups_ssm_state_size,
-                    self.groups_ssm_state_size,
-                    num_heads,
-                    num_heads,
-                    num_heads,
-                    self.num_rope_angles,
-                ],
-                bias=use_bias,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj",
-            )
-        else:
-            total_proj_size = (
-                2 * intermediate_size
-                + 2 * self.groups_ssm_state_size
-                + 3 * num_heads
-                + self.num_rope_angles
-            )
-            self.in_proj = ColumnParallelLinear(
-                input_size=hidden_size,
-                output_size=total_proj_size,
-                bias=use_bias,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj",
-            )
+        self.in_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=self.local_proj_size * self.tp_size,
+            bias=use_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.in_proj",
+        )
+        in_proj_loader = self._make_in_proj_weight_loader()
+        self._set_param_weight_loader(self.in_proj.weight, in_proj_loader)
+        if getattr(self.in_proj, "bias", None) is not None:
+            self._set_param_weight_loader(self.in_proj.bias, in_proj_loader)
 
         self.B_norm_weight = nn.Parameter(torch.ones(ssm_state_size))
         self.C_norm_weight = nn.Parameter(torch.ones(ssm_state_size))
+
+        head_loader = self._make_head_weight_loader(squeeze_siso_rank_dim=False)
+        bc_bias_loader = self._make_head_weight_loader(squeeze_siso_rank_dim=True)
 
         if self.is_mimo:
             self.B_bias = nn.Parameter(
@@ -243,9 +239,9 @@ class MambaMixer3(MambaBase, PluggableLayer):
             self.Zeta = nn.Parameter(
                 torch.ones(self.tped_dt_size, self.mimo_rank, head_dim)
             )
-            set_weight_attrs(self.Psi, {"weight_loader": sharded_weight_loader(0)})
-            set_weight_attrs(self.Phi, {"weight_loader": sharded_weight_loader(0)})
-            set_weight_attrs(self.Zeta, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(self.Psi, {"weight_loader": head_loader})
+            set_weight_attrs(self.Phi, {"weight_loader": head_loader})
+            set_weight_attrs(self.Zeta, {"weight_loader": head_loader})
         else:
             self.B_bias = nn.Parameter(torch.ones(self.tped_dt_size, ssm_state_size))
             self.C_bias = nn.Parameter(torch.ones(self.tped_dt_size, ssm_state_size))
@@ -256,10 +252,10 @@ class MambaMixer3(MambaBase, PluggableLayer):
         self.D = nn.Parameter(torch.ones(self.tped_dt_size))
         self.dt_bias = nn.Parameter(torch.ones(self.tped_dt_size))
 
-        set_weight_attrs(self.B_bias, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.C_bias, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.B_bias, {"weight_loader": bc_bias_loader})
+        set_weight_attrs(self.C_bias, {"weight_loader": bc_bias_loader})
+        set_weight_attrs(self.D, {"weight_loader": head_loader})
+        set_weight_attrs(self.dt_bias, {"weight_loader": head_loader})
 
         self.norm = Mixer2RMSNormGated(
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
@@ -283,6 +279,92 @@ class MambaMixer3(MambaBase, PluggableLayer):
             pass
 
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
+
+    @staticmethod
+    def _set_param_weight_loader(param: nn.Parameter, loader) -> None:
+        if isinstance(param, BasevLLMParameter):
+            param.weight_loader = loader
+        else:
+            if hasattr(param, "weight_loader"):
+                delattr(param, "weight_loader")
+            set_weight_attrs(param, {"weight_loader": loader})
+
+    def _make_in_proj_weight_loader(self):
+        section_sizes = [
+            self.intermediate_size,
+            self.intermediate_size,
+            self.groups_ssm_state_size,
+            self.groups_ssm_state_size,
+            self.num_heads,
+            self.num_heads,
+            self.num_heads,
+            self.num_rope_angles,
+        ]
+        shard_flags = [
+            True,
+            True,
+            (self.n_groups % self.tp_size == 0),
+            (self.n_groups % self.tp_size == 0),
+            True,
+            True,
+            True,
+            False,
+        ]
+        tp_size = self.tp_size
+        tp_rank = self.tp_rank
+
+        def _loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+            if loaded_weight.shape[0] == param.shape[0]:
+                param.data.copy_(loaded_weight)
+                return
+            sections = torch.split(loaded_weight, section_sizes, dim=0)
+            local_sections = []
+            for sec, is_sharded in zip(sections, shard_flags):
+                if is_sharded and tp_size > 1:
+                    shard_len = sec.shape[0] // tp_size
+                    local_sections.append(sec.narrow(0, tp_rank * shard_len, shard_len))
+                else:
+                    local_sections.append(sec)
+            param.data.copy_(torch.cat(local_sections, dim=0))
+
+        return _loader
+
+    def _make_head_weight_loader(self, *, squeeze_siso_rank_dim: bool = False):
+        tp_size = self.tp_size
+        tp_rank = self.tp_rank
+
+        def _loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+            if squeeze_siso_rank_dim:
+                if (
+                    loaded_weight.ndim == 3
+                    and param.ndim == 2
+                    and loaded_weight.shape[1] == 1
+                ):
+                    loaded_weight = loaded_weight.squeeze(1)
+                elif (
+                    loaded_weight.ndim == 2 and param.ndim == 3 and param.shape[1] == 1
+                ):
+                    loaded_weight = loaded_weight.unsqueeze(1)
+            if loaded_weight.shape == param.shape:
+                param.data.copy_(loaded_weight)
+                return
+            shard_size = param.shape[0]
+            assert loaded_weight.shape[0] == shard_size * tp_size
+            param.data.copy_(loaded_weight.narrow(0, tp_rank * shard_size, shard_size))
+
+        return _loader
+
+    @property
+    def mimo_x(self) -> nn.Parameter | None:
+        return self.Psi
+
+    @property
+    def mimo_o(self) -> nn.Parameter | None:
+        return self.Phi
+
+    @property
+    def mimo_z(self) -> nn.Parameter | None:
+        return self.Zeta
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         if self.model_config is not None and self.cache_config is not None:
@@ -318,6 +400,8 @@ class VllmMambaMixer3(MambaMixer3):
         return torch.float32, ssm_state_dtype
 
     def _use_fused_jax_rms_norm(self, jax_tp_size: int) -> bool:
+        if getattr(self.norm, "weight", None) is None:
+            return True
         orig_single_group_replicated = (
             self.tp_size > 1
             and jax_tp_size == 1
@@ -339,12 +423,19 @@ class VllmMambaMixer3(MambaMixer3):
         mimo_rank = getattr(self, "mimo_rank", 1) if is_mimo else 1
         num_rope_angles = getattr(self, "num_rope_angles", self.ssm_state_size // 2)
 
-        if self.n_groups % jax_tp_size == 0 and jax_tp_size == 1:
+        tp_n_groups = getattr(
+            self,
+            "tp_n_groups",
+            self.n_groups // self.tp_size
+            if self.n_groups % self.tp_size == 0
+            else self.n_groups,
+        )
+        if tp_n_groups % jax_tp_size == 0 and jax_tp_size == 1:
             shard_groups = True
-            local_n_groups = (self.n_groups // self.tp_size) // jax_tp_size
+            local_n_groups = tp_n_groups // jax_tp_size
         else:
             shard_groups = False
-            local_n_groups = self.n_groups
+            local_n_groups = tp_n_groups
 
         local_num_heads = (self.num_heads // self.tp_size) // jax_tp_size
         chunk_size = getattr(self, "chunk_size", 32 if dp_enabled else 64)
@@ -510,9 +601,16 @@ class VllmMambaMixer3(MambaMixer3):
                 attn_metadata.seq_lens,
             )
 
-        if apply_py_norm and not getattr(self, "is_mimo", False):
+        if (
+            apply_py_norm
+            and not getattr(self, "is_mimo", False)
+            and getattr(self.norm, "weight", None) is not None
+        ):
             gate = projected_states[..., : self.tped_intermediate_size]
             hidden_states = self.norm(ssm_output, gate)
+        elif apply_py_norm and not getattr(self, "is_mimo", False):
+            gate = projected_states[..., : self.tped_intermediate_size]
+            hidden_states = ssm_output * torch.nn.functional.silu(gate)
         else:
             hidden_states = ssm_output
 
