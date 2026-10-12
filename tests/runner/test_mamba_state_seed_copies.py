@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for the align-mode Mamba state-block seed copies.
 
 These cover the decision logic in
@@ -80,6 +93,7 @@ def _make_self(
     ns = SimpleNamespace(
         _mamba_copy_plan=plan,
         _mamba_state_pos=dict(state_pos or {}),
+        _mamba_offset_seeded=set(req_ids),
         _mamba_state_block_size=state_block_size,
         _pool_block_split=split,
         # Merged block-major pool layout (`None` for per-region pools); row seed
@@ -699,3 +713,62 @@ def test_copy_plan_split_for_seq_on_lane_pool():
         page_bytes=2 * kernel_block_bytes,
     )
     assert split == 2
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+@pytest.mark.parametrize("computed,scheduled", [(384, 1), (382, 4)])
+def test_new_owner_crossing_ignores_recycled_checkpoint_offset(
+    offset, computed, scheduled
+):
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[10] = offset
+    offsets[20] = offset
+    fake, raws = _make_self(
+        ["new"],
+        [computed],
+        [[[10, 11, 12, 13, 14]], [[20, 21, 22, 23, 24]]],
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    fake._mamba_offset_seeded.clear()
+    for raw in raws:
+        raw.copy_(torch.arange(NUM_BLOCKS).unsqueeze(1).expand_as(raw))
+    _collect(fake, _sched({"new": scheduled}))
+    for staged, src, dst in zip(fake._pending_mamba_state_copies, [10, 20], [11, 21]):
+        assert _real_pairs(staged) == [(src, dst)]
+        buffers, src_t, dst_t = staged
+        buffers[0][dst_t.long()] = buffers[0][src_t.long()]
+        assert torch.all(buffers[0][dst] == src)
+        assert int(offsets[src]) == offset  # Do not mutate shared source metadata.
+        assert int(offsets[dst]) == 0
+    assert fake._mamba_offset_seeded == set()  # First-forward reset owns this mark.
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3])
+def test_new_and_live_owners_share_checkpoint_selection_path(offset):
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[10] = offsets[20] = offset
+    fake, _ = _make_self(
+        ["new", "live"],
+        [384, 384],
+        [[[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]]],
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    fake._mamba_offset_seeded.remove("new")
+    _collect(fake, _sched({"new": 1, "live": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [
+        (10, 11),
+        (20 + offset, 21),
+    ]
+
+
+def test_new_owner_without_crossing_leaves_source_selection_to_forward_reset():
+    fake, _ = _spec_self(3, window=4, row=(10, 11, 12, 13, 14))
+    fake._mamba_offset_seeded.clear()
+    fake.input_batch.num_computed_tokens_cpu[0] = BLOCK_SIZE - 2
+    _collect(fake, _sched({"a": 1}))
+    assert fake._pending_mamba_state_copies == []
+    assert int(fake.mamba_slot_read_offsets[10]) == 3

@@ -647,7 +647,7 @@ def _pooled_kda_regions(
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
-        raise ManifestError("KDA transfer requires f32 SSM and bf16 pool rows")
+        raise ManifestError("KDA transfer requires f32 SSM and word-aligned pool rows")
     return {
         TAG_GDN_SSM: (
             0,
@@ -958,6 +958,11 @@ def build_qwen35_pool_manifest(
     return _bind_pool_manifest(entries, raw_tensors)
 
 
+# KV dtypes the Kimi pool is admitted with. The KDA state regions keep their
+# own dtypes inside the pool (gdn_pool_layout), whichever of these it has.
+_KIMI_POOL_DTYPE_TAGS = frozenset({"bfloat16", "float8_e4m3fn"})
+
+
 def build_kimi_k3_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -983,13 +988,16 @@ def build_kimi_k3_pool_manifest(
         shape = tuple(int(dim) for dim in tensor.shape)
         spec = _group_spec_for_layer(kv_cache_groups, layer_name)
         page_bytes = int(spec.page_size_bytes)
-        if len(shape) != 4 or _dtype_tag(tensor) != "bfloat16":
+        dtype_tag = _dtype_tag(tensor)
+        if len(shape) != 4 or dtype_tag not in _KIMI_POOL_DTYPE_TAGS:
             raise ManifestError(
-                f"Kimi cache {layer_name} must be bf16 "
-                f"[blocks, rows, packing, width], got {shape}"
+                f"Kimi cache {layer_name} must be bf16 or fp8 "
+                f"[blocks, rows, packing, width], got {dtype_tag} {shape}"
             )
         num_blocks, rows, packing, width = shape
-        if min(shape) <= 0 or packing != 2:
+        # The packing axis fills one 32-bit word, so a packed row is
+        # 4 * width bytes for either dtype and only its token count differs.
+        if min(shape) <= 0 or packing * _element_size(tensor) != 4:
             raise ManifestError(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
@@ -1144,7 +1152,7 @@ def materialize_storages(manifest: PoolManifest) -> None:
         if hasattr(storage, "cpu"):
             try:  # noqa: SIM105 (non-torch test fakes)
                 storage[:1].cpu()
-            except Exception:  # pragma: no cover - non-torch fakes
+            except Exception:  # pragma: no cover - non-torch fakes  # noqa: S110
                 pass
 
 
@@ -1235,6 +1243,7 @@ def build_glm_mla_pool_manifest(
     named_kv_caches: Mapping[str, Any],
     raw_tensors: Sequence[Any],
     block_size_tokens: int,
+    per_layer_tags: bool = False,
 ) -> PoolManifest:
     """Builds the Pool Manifest for GLM MLA models.
 
@@ -1243,6 +1252,10 @@ def build_glm_mla_pool_manifest(
     The packed [blocks, rows, packing, width] layout is declared as
     row-granular regions; a nope cache carries one row per token,
     every other class packs `packing` tokens per row.
+
+    ``per_layer_tags`` appends the layer index to every tag (``mla.nope.l3``)
+    so a pipeline stage, which holds only some layers, sends each layer's
+    cache to the same layer on the destination.
     """
     if block_size_tokens <= 0:
         raise ManifestError("block_size_tokens must be positive")
@@ -1263,6 +1276,16 @@ def build_glm_mla_pool_manifest(
         flat.append((TAG_DSA_IDX, layer_name, dtype_tag, cache))
     if not any(tag == TAG_MLA_NOPE for tag, _, _, _ in flat):
         raise ManifestError("GLM MLA admission found no latent (mla.nope) caches")
+    if per_layer_tags:
+        tagged = []
+        for tag, layer_name, dtype_tag, tensor in flat:
+            layer_index = layer_index_from_name(layer_name)
+            if layer_index is None:
+                raise ManifestError(
+                    f"per-layer pool tags need a layer index in {layer_name}"
+                )
+            tagged.append((layer_tag(tag, layer_index), layer_name, dtype_tag, tensor))
+        flat = tagged
 
     binding, _ = _binding_for(
         [(layer_name, tensor) for _, layer_name, _, tensor in flat], raw_tensors
@@ -1291,7 +1314,7 @@ def build_glm_mla_pool_manifest(
                 f"num_blocks {num_blocks}"
             )
         live_stride = nbytes // num_blocks
-        if tag == TAG_MLA_NOPE:
+        if class_tag(tag) == TAG_MLA_NOPE:
             # One packed row per token in the nope layout.
             if rows != block_size_tokens:
                 raise ManifestError(
@@ -1326,7 +1349,9 @@ def build_glm_mla_pool_manifest(
                 base_offset_bytes=0,
                 block_stride_bytes=live_stride,
                 num_blocks=num_blocks,
-                regions=_glm_row_region(tag, row_bytes=row_bytes, num_rows=rows),
+                regions=_glm_row_region(
+                    class_tag(tag), row_bytes=row_bytes, num_rows=rows
+                ),
                 dtype_tag=dtype_tag,
             )
         )
@@ -1557,7 +1582,7 @@ def _dsv4_check_role_rows(
         expected = {"latents": tokens * 2}
     for (role, rows), array in zip(expected.items(), arrays):
         shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
-        if len(shape) == 4 and shape[1] != rows:
+        if len(shape) in (3, 4) and shape[1] != rows:
             raise ManifestError(
                 f"DSv4 {kv_tag} layer {layer_name} array {role} has "
                 f"{shape[1]} rows; the {tokens}-token page needs {rows}"
@@ -1602,11 +1627,15 @@ def build_dsv4_pool_manifest(
     claimed_by_group: dict[tuple[int, int], str] = {}
     for tag_base, layer_name, group_index, array in entries:
         dtype_tag = _dtype_tag(array)
-        if dtype_tag != "uint8":
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if dtype_tag == "int32" and len(shape) == 3:
+            # CSA NoPE/RoPE and their overlays are int32 word rows (see
+            # `csa_cache_layout`): a packing-1 row of the same 512 bytes.
+            shape = (shape[0], shape[1], 1, shape[2])
+        elif dtype_tag != "uint8":
             raise ManifestError(
                 f"DSv4 cache {layer_name} ({tag_base}) must be uint8; got {dtype_tag}"
             )
-        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
         if len(shape) != 4:
             raise ManifestError(
                 f"DSv4 cache {layer_name} ({tag_base}) must be "

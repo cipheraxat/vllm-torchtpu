@@ -1,20 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
+from .mock_omni import _MockRotaryEmbeddingWan, vllm_omni_mock  # isort: split
+
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
-from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+from vllm_torchtpu.omni.patches import (
+    apply_omni_model_specific_patches,
+    apply_omni_tpu_patches,
+)
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
+from vllm_torchtpu.omni.rope import (
+    apply_rotary_pair_swap,
+    rotary_embedding_wan_forward,
+)
 
-from .mock_omni import vllm_omni_mock
-
-pytestmark = pytest.mark.cpu_test
+pytestmark = pytest.mark.omni
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -49,8 +59,129 @@ def test_platform_attributes():
         mock_dev.assert_called_once_with("tpu")
 
 
+def test_rope_pair_swap_matches_native():
+    torch.manual_seed(0)
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 24, 3, 16)
+    cos = torch.randn(1, 24, 1, 8)
+    sin = torch.randn(1, 24, 1, 8)
+    torch.testing.assert_close(
+        apply_rotary_pair_swap(x, cos, sin), rope.forward_native(x, cos, sin)
+    )
+    x_bf16, cos_bf16, sin_bf16 = (
+        x.bfloat16(),
+        cos.bfloat16(),
+        sin.bfloat16(),
+    )
+    torch.testing.assert_close(
+        apply_rotary_pair_swap(x_bf16, cos_bf16, sin_bf16),
+        rope.forward_native(x_bf16, cos_bf16, sin_bf16),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_rope_patch_installed():
+    from unittest.mock import MagicMock
+
+    apply_omni_model_specific_patches()
+    assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
+    # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    cos = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
+    sin = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        rope(x, cos, sin), rope.forward_native(x, cos, sin), rtol=0, atol=0
+    )
+
+    # Non-half-dim or Neox calls delegate to _forward_method.
+    rope_fallback = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
+    spy = MagicMock(wraps=rope_fallback.forward_native)
+    rope_fallback._forward_method = spy
+    out_fb = rope_fallback(x, cos, sin)
+    spy.assert_called_once_with(x, cos, sin)
+    torch.testing.assert_close(
+        out_fb, rope_fallback.forward_native(x, cos, sin), rtol=0, atol=0
+    )
+
+    # f32 calls delegate to _forward_method (precision fallback).
+    spy_f32 = MagicMock(wraps=rope.forward_native)
+    rope._forward_method = spy_f32
+    x_f32, cos_f32, sin_f32 = x.float(), cos.float(), sin.float()
+    out_f32 = rope(x_f32, cos_f32, sin_f32)
+    spy_f32.assert_called_once_with(x_f32, cos_f32, sin_f32)
+    torch.testing.assert_close(
+        out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
+    )
+
+
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
+
+
+def test_shared_slicebuilder_addresses(monkeypatch):
+    # Every worker derives the same list from the shared MASTER_PORT.
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+    # A correctly sized inherited list (e.g. another stage's) is replaced too.
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+
+
+def test_dist_backend_after_world_size_pop(monkeypatch):
+    # Building the worker's VllmConfig pops WORLD_SIZE after set_device; the
+    # size set_device recorded must keep multi-rank groups on tpu_dist.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    monkeypatch.delenv("WORLD_SIZE")
+    assert OmniTpuPlatform().dist_backend == "tpu_dist"
+
+
+@pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
+def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
+    # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
+    # (e.g. a diffusion stage in a multi-stage pipeline) is flagged.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    if chips is None:
+        monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    else:
+        monkeypatch.setenv("TPU_VISIBLE_CHIPS", chips)
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with (
+        patch("vllm_torchtpu.omni.platform.logger.warning") as mock_warning,
+        patch("torch.empty"),
+        patch("torch.device"),
+    ):
+        OmniTpuPlatform.set_device(None)
+    assert mock_warning.called == warns
 
 
 def test_memory_methods(monkeypatch):
@@ -156,6 +287,28 @@ def test_ltx2_safe_decode_output():
     assert res.output == (None, None)
 
 
+@pytest.mark.parametrize(
+    "rope_cls_name",
+    ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
+)
+def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
+    apply_omni_model_specific_patches()
+
+    rope_cls = getattr(qwen_image_transformer, rope_cls_name)
+    rope = rope_cls()
+
+    vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
+
+    assert not txt_freqs._is_view()
+    assert (
+        txt_freqs.untyped_storage().data_ptr()
+        != rope.pos_freqs.untyped_storage().data_ptr()
+    )
+    assert torch.equal(txt_freqs, rope.pos_freqs[2:5])
+    assert txt_freqs.dtype == torch.complex64
+    assert torch.equal(vid_freqs, rope.pos_freqs[:2])
+
+
 def test_safe_pack_tensor_if_large():
     from unittest.mock import MagicMock
 
@@ -191,3 +344,14 @@ def test_safe_pack_tensor_if_large():
     res = ipc._pack_tensor_if_large(t)
     assert t.cpu_called is True
     assert res["device"] == "cpu"
+
+
+def test_omni_tpu_patches_configuration(monkeypatch):
+    # Call the undecorated body so the run-once cache is left alone, and
+    # restore the process-global state it edits (env var, F.interpolate).
+    orig_interpolate = torch.nn.functional.interpolate
+    monkeypatch.setattr(torch.nn.functional, "interpolate", orig_interpolate)
+    with patch.dict(os.environ):
+        os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
+        apply_omni_tpu_patches.__wrapped__()
+        assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"

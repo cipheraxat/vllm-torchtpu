@@ -15,6 +15,17 @@ def _legacy_ray_executor() -> bool:
     )
 
 
+def _torch_tpu_builds_stage_meshes() -> bool:
+    """Whether the installed torch_tpu builds a Pallas mesh over a pipeline
+    stage's process group; its releases accept world-size meshes only."""
+    from torch_tpu._internal.pallas import pallas
+
+    return not hasattr(pallas, "_validate_pallas_mesh_world_size")
+
+
+_FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
+
+
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
     """Describe the first stage holding no full-attention layer, or None.
 
@@ -31,7 +42,7 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     for stage in range(stages):
         start, end = get_pp_indices(len(layer_types), stage, stages)
         kinds = layer_types[start:end]
-        if "full_attention" not in kinds:
+        if not any(kind in _FULL_ATTENTION_LAYER_TYPES for kind in kinds):
             return (
                 f"stage {stage} holds layers {start}-{end - 1}, "
                 f"{'/'.join(sorted(set(kinds)))} only"
@@ -56,6 +67,36 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # same collectives; warmup, where every stage runs them, passes.
         unsupported = "tensor parallelism inside a stage"
         remedy = " Use --tensor-parallel-size 1."
+    elif (
+        parallel_config.prefill_context_parallel_size > 1
+        or (
+            parallel_config.data_parallel_size > 1
+            and parallel_config.enable_expert_parallel
+        )
+    ) and not _torch_tpu_builds_stage_meshes():
+        # A stage of several devices builds its meshes, and the hand-off its
+        # per-column mesh, over a group smaller than the world.
+        # TODO(yinlin): google-pytorch/torch_tpu#4387 builds those for a group
+        # made standalone; make each stage group standalone and drop this
+        # guard once the pinned torch_tpu has it.
+        unsupported = (
+            "pipeline stages of several devices (context parallelism, or expert "
+            "parallelism across data-parallel ranks) with this torch_tpu"
+        )
+        remedy = (
+            " They need a torch_tpu that builds Pallas meshes over a stage's"
+            " process group."
+        )
+    elif (
+        parallel_config.prefill_context_parallel_size > 1
+        and vllm_config.kv_transfer_config is not None
+        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+    ):
+        # These connectors pair a stage with its peer through one pool per
+        # device; a context-parallel stage spreads a request over several.
+        # The raiden connector lowers each PCP worker's chunks of the
+        # stage's layers.
+        unsupported = "KV transfer connectors with context-parallel stages"
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async
         # placeholder substitution reads from the device.

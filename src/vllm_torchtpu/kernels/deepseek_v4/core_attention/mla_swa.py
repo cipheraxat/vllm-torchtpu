@@ -22,6 +22,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
@@ -32,6 +34,52 @@ def cdiv(a, b):
 
 def align_to(x, a):
     return cdiv(x, a) * a
+
+
+def narrow_page_indices(
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    *,
+    sliding_window: int,
+    logical_page_size: int,
+    max_q_len: int,
+    max_kv_pages_per_block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Keep only the pages each sequence's sliding window can touch.
+
+    The kernels copy `page_indices` into SMEM, and at long max model lengths
+    the full table is large: 8,192 int32 entries per sequence at 1M tokens and
+    128-token pages. The kernels compute every position from `kv_lens`, so
+    dropping whole pages before the window and reducing `kv_lens` by the same
+    number of tokens keeps every read and write on the same page.
+
+    Each sequence keeps `window_pages` entries, starting at the page of the
+    first key any of its queries can see. They cover the keys and new tokens,
+    which can start partway into a page, the pages a kv block can read past
+    them, and one page of margin.
+
+    Returns the shifted `kv_lens` and a `[max_num_seqs * window_pages]` table,
+    or the inputs unchanged when the table is already that narrow.
+    """
+    max_num_seqs = kv_lens.shape[0]
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+
+    span_pages = cdiv(max_q_len + sliding_window, logical_page_size) + 1
+    window_pages = span_pages + max_kv_pages_per_block + 1
+    if window_pages >= pages_per_seq:
+        return kv_lens, page_indices
+
+    # Same bound as the kernels' `_start_offset` for the first query block.
+    q_lens = jnp.maximum(cu_q_lens[1:] - cu_q_lens[:-1], 0)
+    first_key = jnp.maximum(kv_lens - q_lens - sliding_window + 1, 0)
+    first_page = first_key // logical_page_size
+
+    window = jnp.arange(window_pages, dtype=first_page.dtype)
+    cols = jnp.minimum(first_page[:, None] + window[None, :], pages_per_seq - 1)
+    table = page_indices.reshape(max_num_seqs, pages_per_seq)
+    narrowed = jnp.take_along_axis(table, cols, axis=1).reshape(-1)
+    return kv_lens - first_page * logical_page_size, narrowed
 
 
 def get_dtype_bitwidth(dtype):
@@ -102,7 +150,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     m_ref,  # [bq_sz * num_q_heads],
     acc_ref,  # [bq_sz * num_q_heads, head_dim],
     *,
-    static_q_len: int,
+    static_q_len: int | None,
     sm_scale: float,
     sliding_window: int,
     logical_page_size: int,
@@ -117,6 +165,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
 
+    # An int32 CSA host array is viewed as the uint8 slabs it holds.
+    cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(cache_kv_hbm_ref)
+    updated_cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(updated_cache_kv_hbm_ref)
     total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
         cache_kv_hbm_ref.shape
     )
@@ -898,6 +949,9 @@ def _mla_batched_decode_kernel(
             cp.start()
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
+    # An int32 CSA host array is viewed as the uint8 slabs it holds.
+    cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(cache_kv_hbm_ref)
+    updated_cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(updated_cache_kv_hbm_ref)
     total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
         cache_kv_hbm_ref.shape
     )
@@ -1272,7 +1326,11 @@ def run_mla_batched_decode_kernel(
         phys_tokens_per_page,
         pages_per_seq,
     ) = get_physical_layout(
-        cache_kv.shape, q.dtype, head_dim, max_num_seqs, num_page_indices
+        csa_cache_layout.u8_slab_shape(cache_kv.shape, cache_kv.dtype),
+        q.dtype,
+        head_dim,
+        max_num_seqs,
+        num_page_indices,
     )
 
     scalar_prefetches = (
@@ -1440,7 +1498,9 @@ def mla_sliding_window_ragged_paged_attention(
     Args:
       q: concatenated all sequences' queries.
       new_kv: concatenated all sequences' kv values
-      cache_kv: the current kv cache.
+      cache_kv: the current kv cache: uint8 slabs, or an int32
+        [total_num_pages, rows, 128] CSA host array holding the same bytes
+        (see `csa_cache_layout`).
       kv_lens: the length of each sequence in the kv cache.
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
@@ -1498,9 +1558,14 @@ def mla_sliding_window_ragged_paged_attention(
     # quantization and dequantization for DSV4 fp8 format here because
     # align(448 + 64 + 7, 512) = 1024 bytes, which is same as the plain 512 bf16,
     # thus no benefit from dsv4 fp8 format.
-    assert cache_kv.dtype == jnp.uint8
+    #
+    # The CSA host may be declared int32 (see `csa_cache_layout`); the kernels
+    # view it as the same uint8 slabs.
+    assert cache_kv.dtype in (jnp.uint8, jnp.int32)
     head_dim = q.shape[-1]
-    _, physical_page_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+    _, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
+        csa_cache_layout.u8_slab_shape(cache_kv.shape, cache_kv.dtype)
+    )
 
     slot_bytes = kv_packing * lkv_dim
     token_bytes = head_dim * get_dtype_bitwidth(new_kv.dtype) // 8
@@ -1516,6 +1581,15 @@ def mla_sliding_window_ragged_paged_attention(
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
+    kv_lens, page_indices = narrow_page_indices(
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        max_q_len=q.shape[0],
+        max_kv_pages_per_block=max(num_kv_pages_per_blocks),
+    )
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
@@ -1564,7 +1638,7 @@ def mla_sliding_window_ragged_paged_attention(
 
         bkv_double_buf = pltpu.VMEM(
             (2, bkv_sz, slots_per_token * kv_packing, lkv_dim),
-            cache_kv.dtype,
+            jnp.uint8,
         )
 
         bq_double_bufq = pltpu.VMEM(

@@ -163,7 +163,7 @@ def _attention_hca(
         swa_m=swa_m,
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(32, 32, 32),
+        num_kv_pages_per_block=(128, 32, 32),
         num_queries_per_block=(1, 32, 32),
     )
     return output, updated_sw_cache
@@ -292,7 +292,7 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
             return block_size
         return min(block_size, window_size)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Update self.block_size so the returned spec and the Pallas kernel's
         # logical_page_size in attention.py agree on the final runtime block size.
         self.block_size = self._swa_block_size(

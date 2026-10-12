@@ -1,9 +1,25 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEFactory
 
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
+
+pytestmark = pytest.mark.tpu_test
 
 
 def _build_layer_and_method(device):
@@ -221,3 +237,24 @@ class TestMxfp4MoETPU:
         assert w2_weight_processed.dtype == torch.uint8
         assert w13_weight_scale.shape[0] == w13_weight_processed.shape[0]
         assert w2_weight_scale.shape[0] == w2_weight_processed.shape[0]
+
+
+def test_device_dequant_matches_cpu_reference_bit_for_bit():
+    # The select-based decode must reproduce the LUT reference exactly for
+    # every packed byte (all 16 x 16 nibble pairs), in fp32 and bf16.
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        _dequantize_mxfp4_packed_on_device,
+    )
+    from vllm_torchtpu.layers.core.quantization import dequantize_mxfp4_packed
+
+    gen = torch.Generator().manual_seed(0)
+    # [E=2, out=8, in/2=64]: in=128, four 32-wide scale blocks per row.
+    packed = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(2, 2, 64)
+    packed = packed.repeat(1, 4, 1)
+    scale = torch.randint(110, 145, (2, 8, 4), dtype=torch.uint8, generator=gen)
+
+    for out_dtype in (torch.float32, torch.bfloat16):
+        expected = dequantize_mxfp4_packed(packed, scale, -1, out_dtype)
+        actual = _dequantize_mxfp4_packed_on_device(packed, scale, -1, out_dtype)
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual, expected)

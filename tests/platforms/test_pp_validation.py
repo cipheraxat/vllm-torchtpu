@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu.platforms import pp_validation
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 
 
@@ -14,10 +15,17 @@ def _config(
     kv_transfer=None,
     tp=1,
     layer_types=None,
+    pcp=1,
+    dp=1,
+    ep=False,
 ):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=pp, tensor_parallel_size=tp
+            pipeline_parallel_size=pp,
+            tensor_parallel_size=tp,
+            prefill_context_parallel_size=pcp,
+            data_parallel_size=dp,
+            enable_expert_parallel=ep,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=speculative,
@@ -100,6 +108,48 @@ def test_rejects_tensor_parallel_stages():
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
 
+@pytest.fixture
+def stage_meshes(monkeypatch):
+    """A torch_tpu that builds meshes over a stage's process group."""
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
+
+
+def test_accepts_context_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=2))
+
+
+def test_rejects_context_parallel_stages_on_world_size_meshes(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
+    with pytest.raises(NotImplementedError, match="stages of several devices"):
+        validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
+
+
+def test_rejects_expert_parallel_stages_on_world_size_meshes(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
+    with pytest.raises(NotImplementedError, match="stages of several devices"):
+        validate_pipeline_parallel_config(_config(pp=4, dp=2, ep=True))
+
+
+def test_pipeline_stages_of_one_device_skip_the_torch_tpu_check(monkeypatch):
+    def unexpected():
+        raise AssertionError("probed torch_tpu for a stage of one device")
+
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", unexpected)
+    validate_pipeline_parallel_config(_config(pp=8))
+    validate_pipeline_parallel_config(_config(pp=4, dp=2))
+    validate_pipeline_parallel_config(_config(pp=8, ep=True))
+
+
+def test_rejects_other_kv_transfer_with_context_parallel_stages(stage_meshes):
+    other = SimpleNamespace(kv_connector="TPUConnectorHMA")
+    with pytest.raises(NotImplementedError, match="context-parallel stages"):
+        validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=other))
+
+
+def test_raiden_accepts_context_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
+
+
 def test_rejects_the_legacy_ray_executor(monkeypatch):
     monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
     monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "0")
@@ -113,3 +163,11 @@ def test_accepts_the_ray_v2_executor(monkeypatch):
     monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
     monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1")
     validate_pipeline_parallel_config(_config(pp=2))
+
+
+def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
+    # GLM-5.2: every layer is sparse attention with its own latent cache.
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    validate_pipeline_parallel_config(
+        _config(pp=8, kv_transfer=RAIDEN, layer_types=["deepseek_sparse_attention"] * 8)
+    )

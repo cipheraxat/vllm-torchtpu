@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -32,18 +33,18 @@ from vllm_torchtpu.kernels.gdn.v3 import (
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
-    b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    conv_state_slot_ref: jax.Ref,  # [seq, prev_kernel_size, 1, dim_size]
+    recurrent_slot_ref: jax.Ref,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: jax.Ref,  # [seq * chunk, num_v_heads, v_head]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
-    carry_conv_scratch_ref: jax.Array | None,
-    carry_recurrent_scratch_ref: jax.Array | None,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -114,7 +115,9 @@ def inner_kernel(
     )
 
     if cfg.state_plan is None:
-        conv_state_slot_ref[...] = new_conv_state
+        # Only the checkpoint positions; the extra incoming-state position
+        # (`cfg.state_in_pos`) is never copied out.
+        conv_state_slot_ref[:, : cfg.window_size] = new_conv_state
     else:
         # External source tiles: encode each window position's checkpoint
         # through the region's typed view; copy_out pushes the raw bytes
@@ -219,7 +222,9 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
+        recurrent_slot_ref[:, : cfg.window_size] = new_recurrent_state.astype(
+            recurrent_slot_ref.dtype
+        )
     else:
         for idx in range(cfg.seq_tile_size):
             for t in range(cfg.window_size):
@@ -473,6 +478,7 @@ def fused_conv1d_gdn(
         )
     else:
         assert state_source is None
+        assert conv_state is not None and recurrent_state is not None
         conv_out_dtype = conv_state.dtype
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
@@ -544,12 +550,15 @@ def fused_conv1d_gdn(
         # weights, activations scratch and compiler temporaries).
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        recurrent_bytes_per_seq = window * n_v * d_k * d_v * 4
+        # State tiles hold `window` checkpoints plus one dedicated
+        # incoming-state position (`GDNConfig.state_in_pos`) when window > 1.
+        state_positions = window + (1 if window > 1 else 0)
+        recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
         bytes_per_seq = (
             # Recurrent checkpoints (fp32) — the dominant term.
             recurrent_bytes_per_seq
             # Conv checkpoints (fp32).
-            + window * (kernel_size - 1) * dim * 4
+            + state_positions * (kernel_size - 1) * dim * 4
             # qkv (fp32), b/a (fp32), out (act_out).
             + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
         )
@@ -592,8 +601,8 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
     if not pooled:
-        conv_state_shape = conv_state.shape
-        conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+        conv_state_shape = cast(jax.Array, conv_state).shape
+        conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
@@ -642,7 +651,9 @@ def fused_conv1d_gdn(
                 act_out=act_out_dtype,
                 compute=compute_precision,
                 recurrent_state=(
-                    jnp.float32.dtype if pooled else in_recurrent_state.dtype
+                    jnp.float32.dtype
+                    if pooled
+                    else cast(jax.Array, in_recurrent_state).dtype
                 ),
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),

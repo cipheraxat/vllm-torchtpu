@@ -41,13 +41,16 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
@@ -87,25 +90,24 @@ from vllm_torchtpu.layers.core.quantization import (
     unpack_uint8_to_fp4,
 )
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import align_to, synchronize_tensors
+from vllm_torchtpu.utils import align_to, fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
+    from vllm_torchtpu.layers.adapter.quantization.configs import (
+        TpuLinear,
+        TpuRoutedExperts,
+    )
+
 logger = init_logger(__name__)
-
-
-def _fresh(t: torch.Tensor) -> torch.Tensor:
-    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-    the torch_tpu pallas boundary ships a plain row-major buffer)."""
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
 
 
 def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
     """[*, out, num_blocks] fp32 -> [*, num_blocks, 1, out] fp32 (gmm_v2 rhs
     scale layout), as a fresh contiguous buffer."""
     s = scale_f32.transpose(-1, -2).contiguous()  # [*, num_blocks, out]
-    return _fresh(s.unsqueeze(-2))  # [*, num_blocks, 1, out]
+    return fresh_buffer(s.unsqueeze(-2))  # [*, num_blocks, 1, out]
 
 
 def _requant_moe_w4a8(
@@ -153,7 +155,12 @@ def _requant_moe_w4a8(
     w2_out = pack_fp4_indices(w2_idx)  # [E, H, I_pad/2]
     w2_scale_4d = _to_kernel_scale(w2_s.to(torch.float32))
 
-    return (_fresh(w13_out), _fresh(w13_scale_4d), _fresh(w2_out), _fresh(w2_scale_4d))
+    return (
+        fresh_buffer(w13_out),
+        fresh_buffer(w13_scale_4d),
+        fresh_buffer(w2_out),
+        fresh_buffer(w2_scale_4d),
+    )
 
 
 def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
@@ -163,8 +170,12 @@ def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
         requant_block = int(requant_block)
         hidden, inter = w13.shape[-1] * 2, w2.shape[-1] * 2
         if hidden % requant_block == 0 and inter % requant_block == 0:
-            w13, s13 = requant_load_kmajor_fp4(_fresh(w13), w13_scale_f, requant_block)
-            w2, s2 = requant_load_kmajor_fp4(_fresh(w2), w2_scale_f, requant_block)
+            w13, s13 = requant_load_kmajor_fp4(
+                fresh_buffer(w13), w13_scale_f, requant_block
+            )
+            w2, s2 = requant_load_kmajor_fp4(
+                fresh_buffer(w2), w2_scale_f, requant_block
+            )
             return (w13, w2, s13, s2), f"FP4 (jax requant block-{requant_block})"
         # Pad each gate/up half and w2's contracting dimension together.
         w13, s13, w2, s2 = _requant_moe_w4a8(
@@ -172,7 +183,7 @@ def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
         )
         mode = f"FP4 (torch requant block-{requant_block})"
     else:
-        w13, w2 = _fresh(w13), _fresh(w2)
+        w13, w2 = fresh_buffer(w13), fresh_buffer(w2)
         s13, s2 = _to_kernel_scale(w13_scale_f), _to_kernel_scale(w2_scale_f)
         mode = "FP4 (block-16)"
     return (load_kmajor_fp4(w13), load_kmajor_fp4(w2), s13, s2), mode
@@ -237,7 +248,7 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
     dispatches layers to TPU-native W4A16 methods."""
 
     @classmethod
-    def get_name(cls) -> str:
+    def get_name(cls) -> QuantizationMethods:
         return NVFP4
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
@@ -365,6 +376,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU NVFP4 MoE does not support bias."
         assert self.moe.is_act_and_mul, (
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
@@ -500,6 +512,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
@@ -591,6 +604,8 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         self.quant_config = quant_config
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
+        # vLLM types this as an NvFp4LinearKernel; TPU installs a stand-in.
+        # pyrefly: ignore[bad-assignment]
         self.kernel = _NullInputQuantKernel()
 
     def create_weights(
@@ -628,6 +643,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, LinearBase)
+        layer = cast("TpuLinear", layer)
         # Fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # weight_scale_2 is the per-tensor global, replicated across the fused
         # output partitions; parallel q/k/v share one value. Assert agreement
@@ -641,12 +657,14 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
             layer.weight_scale.data.to(torch.float32) * global_scale
         )  # [N, K/group]
         # gmm_v2 rhs scale layout for a single group: [1, num_blocks, 1, N].
-        scale_4d = _to_kernel_scale(weight_scale).unsqueeze(0)  # [1, K/group, 1, N]
+        scale_4d = fresh_buffer(
+            _to_kernel_scale(weight_scale).unsqueeze(0)
+        )  # [1, K/group, 1, N]
 
         # Unpack to native fp4 in the kernel's K-major layout once at load (see
         # load_kmajor_fp4); the forward then runs native fp4 with no per-forward
         # unpack. [N, K/2] uint8 -> [K, N] torch.float4_e2m1fn_x2.
-        weight = load_kmajor_fp4(_fresh(layer.weight.data))
+        weight = load_kmajor_fp4(fresh_buffer(layer.weight.data))
 
         for attr in ("weight_scale_2", "input_scale"):
             if hasattr(layer, attr):
@@ -671,6 +689,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        layer = cast("TpuLinear", layer)
         out = quantized_matmul_fp4(x, layer.weight, layer.weight_scale)
         if bias is not None:
             out = out + bias

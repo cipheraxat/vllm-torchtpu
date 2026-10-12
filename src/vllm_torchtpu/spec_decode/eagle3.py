@@ -5,7 +5,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -17,7 +17,10 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.attention_metadata import (
+    AttentionMetadata,
+    AttentionMetadataBuilderContext,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -154,8 +157,9 @@ class Eagle3Proposer:
     ):
         self.runner = runner
         self.vllm_config = vllm_config
-        self.speculative_config = vllm_config.speculative_config
-        assert self.speculative_config is not None
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.speculative_config = speculative_config
         draft_tp = self.speculative_config.draft_tensor_parallel_size
         target_tp = self.vllm_config.parallel_config.tensor_parallel_size
         # Default to (draft_tp == target tp) when unset. vLLM's
@@ -201,11 +205,12 @@ class Eagle3Proposer:
         # during the target verify forward.
         self.draft_chunks: list[DraftChunkInputs] | None = None
         # Per-propose-call cache of loop-step draft attention metadata, keyed
-        # by id(chunk). Between loop iterations of one step everything in the
-        # metadata is constant except seq_lens advancing by +1, so iterations
-        # >= 2 swap the seq_lens field on the cached objects instead of paying
-        # the full upstream builder walk per iteration.
-        self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+        # by id(chunk): (metadata, seq_lens, seq_lens_delta) of the chunk's
+        # last loop step. Between loop steps everything in the metadata is
+        # constant except seq_lens, which moves with seq_lens_delta, so steps
+        # >= 2 swap the seq_lens field on the cached objects instead of
+        # recomputing it or paying the full upstream builder walk.
+        self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -215,6 +220,11 @@ class Eagle3Proposer:
         self._mtp_loop_model: torch.nn.Module | None = None
         # Whether that program has run once (its first run compiles it).
         self._mtp_loop_model_warm = False
+        # MTP loop steps 1..K-1 as one compiled program (see
+        # mtp_fused_loop.py), and whether it has run once. Built in
+        # load_model; None means the per-step loop.
+        self._mtp_fused_loop: torch.nn.Module | None = None
+        self._mtp_fused_loop_warm = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -250,6 +260,7 @@ class Eagle3Proposer:
             self._validate_pcp_draft_model(draft_attn_layer_names)
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
+        assert self.draft_model is not None
         maybe_share_embeddings(
             self.draft_model, target_model, self._draft_tp_matches_target
         )
@@ -282,6 +293,7 @@ class Eagle3Proposer:
         self._init_mtp_index_sharing()
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
+        self._build_mtp_fused_loop()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -335,6 +347,7 @@ class Eagle3Proposer:
         num_mtp_layers = getattr(mtp_model, "num_mtp_layers", None)
         if num_mtp_layers is None or num_mtp_layers <= 1:
             return
+        assert self.draft_model is not None
         if not any(True for _ in iter_mtp_shared_heads(self.draft_model)):
             return
         raise NotImplementedError(
@@ -445,6 +458,7 @@ class Eagle3Proposer:
         one compiled program. If the program can't be built, IndexShare is
         switched off rather than left in place doing nothing.
         """
+        assert self.draft_model is not None
         try:
             from vllm_torchtpu.spec_decode.mtp_loop_model import (
                 MTP_DYNAMIC_ARG_DIMS,
@@ -490,7 +504,122 @@ class Eagle3Proposer:
             len(self._mtp_topk_buffers),
         )
 
-    def _draft_model_for_step(self, step_idx: int):
+    def _build_mtp_fused_loop(self) -> None:
+        """Compile an MTP draft's loop steps 1..K-1 as one program, so the
+        host dispatches once per propose for them instead of twice per step.
+        Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
+
+        Only for the plain case: IndexShare restores top-k rows between steps
+        on the host, a draft->target id map would need its gather in the
+        program, and a cross-model KV-sharing draft (Gemma-4 MTP) keeps
+        positions and seq_lens fixed across steps where the program advances
+        them.
+        """
+        draft_model = self.draft_model
+        if (
+            draft_model is None
+            or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
+            or self.speculative_config.method != "mtp"
+            or self._share_mtp_indices
+            or not self.advance_draft_positions
+            or getattr(draft_model, "draft_id_to_target_id", None) is not None
+        ):
+            return
+        draft_dims = getattr(draft_model, "_dynamic_arg_dims", None)
+        if draft_dims is None:
+            return
+        K = self.speculative_config.num_speculative_tokens
+        if K < 2:
+            return
+        try:
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
+
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                ),
+                set_current_vllm_config(self.draft_vllm_config),
+            ):
+                self._mtp_fused_loop = build_mtp_fused_loop(
+                    vllm_config=self.draft_vllm_config,
+                    prefix=f"mtp_fused_loop_k{K}",
+                    mtp=draft_model,
+                    num_steps=K - 1,
+                    dynamic_arg_dims=draft_dims,
+                )
+        except Exception:
+            logger.warning(
+                "Could not build the fused MTP loop program; draft loop steps "
+                "run one program each.",
+                exc_info=True,
+            )
+            self._mtp_fused_loop = None
+            return
+        self._mtp_fused_loop_warm = False
+        logger.info("MTP draft loop steps 1..%d run as one compiled program.", K - 1)
+
+    def _run_mtp_fused_loop(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_rejected_np: np.ndarray | None,
+        num_rejected_dev: torch.Tensor | None,
+        loop_query_start_loc: torch.Tensor,
+        loop_request_distribution: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Draft steps 1..K-1 of one chunk in one dispatch.
+
+        `input_ids` is step 0's token and `positions` step 1's. Returns the
+        K-1 tokens, or None when this chunk's metadata doesn't fit the
+        program (the caller then runs the per-step loop).
+        """
+        attn_metadata = self._build_draft_attn_metadata(
+            chunk=chunk,
+            step_idx=1,
+            seq_lens_delta=1,
+            num_rejected_np=num_rejected_np,
+            num_rejected_dev=num_rejected_dev,
+            loop_query_start_loc=loop_query_start_loc,
+            loop_request_distribution=loop_request_distribution,
+        )
+        # The program bumps seq_lens in place between steps; every draft
+        # layer must read that one tensor. It is fresh from the step-1 build
+        # (base + 1 - rejected), so nothing else holds it -- except the
+        # loop-step metadata cache, which only steps >= 2 read.
+        seq_lens_set = {id(md.seq_lens): md.seq_lens for md in attn_metadata.values()}
+        if len(seq_lens_set) != 1:
+            return None
+        (seq_lens,) = seq_lens_set.values()
+        self._draft_md_cache.pop(id(chunk), None)
+
+        num_tokens = input_ids.shape[0]
+        with (
+            set_model_tag("eagle_head"),
+            set_forward_context(
+                attn_metadata,
+                self.draft_vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+            ),
+        ):
+            if not self._mtp_fused_loop_warm:
+                # The first call traces and compiles; like the loop-step
+                # program's, its outputs can carry symbolic sizes, so run it
+                # again compiled. The repeat rewrites the same KV entries;
+                # seq_lens is put back first because the program advanced it.
+                seq_lens_step1 = seq_lens.clone()
+                self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+                seq_lens.copy_(seq_lens_step1)
+                self._mtp_fused_loop_warm = True
+            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+
+    def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
 
         Without IndexShare that is always the draft itself. With it, step 0
@@ -498,14 +627,17 @@ class Eagle3Proposer:
         (indexer off). `skip_topk` is set before every call, but it only
         matters on each program's first run, when it gets baked in.
         """
-        if self._mtp_loop_model is None:
+        assert self.draft_model is not None
+        loop_model = self._mtp_loop_model
+        if loop_model is None:
             return self.draft_model
         loop_step = step_idx > 0
         self._mtp_set_skip_topk(loop_step)
-        return self._mtp_loop_model if loop_step else self.draft_model
+        return loop_model if loop_step else self.draft_model
 
     def _mtp_set_skip_topk(self, skip: bool) -> None:
         if self._share_mtp_indices:
+            assert self.draft_model is not None
             self.draft_model.model.set_skip_topk(skip)
 
     def _mtp_compact_and_save(self, gather_indices: torch.Tensor) -> list[torch.Tensor]:
@@ -519,6 +651,7 @@ class Eagle3Proposer:
         position-in-the-current-forward, so the *next* chunk's step-0 indexer
         write lands on exactly these rows and destroys them.
         """
+        assert self.draft_model is not None
         self.draft_model.model.compact_topk_indices(gather_indices)
         num_rows = gather_indices.shape[0]
         return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
@@ -589,6 +722,7 @@ class Eagle3Proposer:
             return
         self._validate_kv_sharing_supported()
 
+        assert self.draft_model is not None
         draft_text_config = self.draft_model.config.get_text_config()
         target_text_config = target_model.config.get_text_config()
         target_layer_types = getattr(target_text_config, "layer_types", [])
@@ -826,6 +960,7 @@ class Eagle3Proposer:
         # torch-tpu DEFER_AND_FUSE path fuses with per-step-varying neighbors in
         # the K-step propose loop -> a fresh fused program per context. Enclosing
         # them makes a fixed, bucketed program per [n, hidden] shape.
+        assert self.draft_model is not None
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts
@@ -876,6 +1011,7 @@ class Eagle3Proposer:
         # per live dispatch context, or (c) fuse the combine mm forward into the
         # downstream draft_input_ids seed scatter. Same pattern as
         # _draft_propose_token / _draft_gather_carries.
+        assert self.draft_model is not None
         return self.draft_model.combine_hidden_states(
             torch.cat((aux0, aux1, aux2), dim=-1)
         )
@@ -906,7 +1042,7 @@ class Eagle3Proposer:
 
     def propose(
         self,
-        sampled_token_ids: list[list[int]],
+        sampled_token_ids: list[list[int]] | None,
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
         scheduler_output,
@@ -964,6 +1100,9 @@ class Eagle3Proposer:
         hidden_carry_per_chunk = []
         positions_carry_per_chunk = []
         rejected_per_chunk = []
+        # The same counts as host arrays for the draft metadata builds; None
+        # when async, where they stay on device.
+        rejected_np_per_chunk: list[np.ndarray | None] = []
         uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         draft_tokens_per_chunk = []
         is_async = next_tokens_per_chunk is not None
@@ -983,6 +1122,7 @@ class Eagle3Proposer:
                     "hidden state was captured for this chunk."
                 )
                 if self.speculative_config.method == "eagle3":
+                    assert self.draft_model is not None
                     with set_model_tag("eagle_head"):
                         target_hidden_states = self.draft_model.combine_hidden_states(
                             chunk.hidden_states
@@ -999,12 +1139,17 @@ class Eagle3Proposer:
                     num_rejected_tokens_np,
                     scheduler_output,
                     next_tokens_device=(
-                        None if not is_async else next_tokens_per_chunk[ci]
+                        None
+                        if next_tokens_per_chunk is None
+                        else next_tokens_per_chunk[ci]
                     ),
                     device_seed=device_seed,
                 )
             )
             rejected_per_chunk.append(num_rejected)
+            rejected_np_per_chunk.append(
+                None if isinstance(num_rejected, torch.Tensor) else num_rejected
+            )
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
@@ -1012,7 +1157,7 @@ class Eagle3Proposer:
                 target_hidden_states=target_hidden_states,
                 step_idx=0,
                 seq_lens_delta=0,
-                num_rejected_np=(None if is_async else num_rejected),
+                num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
@@ -1070,13 +1215,16 @@ class Eagle3Proposer:
                     if c.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
+                assert knr is not None
                 if is_async:
                     rejected_dev_per_chunk.append(
                         _maybe_pad_dim0(nr, knr) if nr is not None else None
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: c.num_reqs] = nr.astype(np.int32, copy=False)
+                    padded_nr[: c.num_reqs] = cast(np.ndarray, nr).astype(
+                        np.int32, copy=False
+                    )
                     rejected_dev_per_chunk.append(
                         torch.from_numpy(padded_nr).to(runner.device)
                     )
@@ -1093,6 +1241,7 @@ class Eagle3Proposer:
                     if c.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
+                assert knr is not None
                 qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
                 loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
                 loop_reqdist_per_chunk.append(
@@ -1100,37 +1249,69 @@ class Eagle3Proposer:
                         [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
                     )
                 )
-            for step in range(1, K):
+
+            def run_draft_step(ci: int, step: int) -> None:
+                """One separate draft step for chunk `ci`: a draft forward
+                and an lm-head + argmax, each its own dispatch."""
+                chunk = chunks[ci]
+                if self.advance_draft_positions:
+                    loop_positions[ci] = loop_positions[ci] + 1
+                # Prev step's [p] tokens feed directly — already bucketed.
+                loop_input_ids = draft_tokens_per_chunk[ci][-1]
+                last_hidden, hidden = self._forward_draft(
+                    chunk=chunk,
+                    input_ids=loop_input_ids,
+                    positions=loop_positions[ci],
+                    target_hidden_states=loop_hidden[ci],
+                    step_idx=step,
+                    seq_lens_delta=(step if self.advance_draft_positions else 0),
+                    num_rejected_np=rejected_np_per_chunk[ci],
+                    num_tokens_padded=padded_nr_per_chunk[ci],
+                    num_rejected_dev=rejected_dev_per_chunk[ci],
+                    loop_query_start_loc=loop_qsl_per_chunk[ci],
+                    loop_request_distribution=loop_reqdist_per_chunk[ci],
+                )
+                with set_model_tag("eagle_head"):
+                    draft_tokens_per_chunk[ci].append(
+                        self._draft_propose_token(last_hidden)
+                    )
+                loop_hidden[ci] = hidden
+
+            if self._mtp_fused_loop is not None and not runner._dp_lockstep_enabled():
+                # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
+                # is fine here: the separate path is step-major only for
+                # IndexShare's shared top-k buffer, which the fused program
+                # never runs with.
                 for ci, chunk in enumerate(chunks):
-                    if self._share_mtp_indices:
-                        # The loop is step-major, so chunks interleave and each
-                        # one finds the buffer holding its predecessor's rows.
-                        # Restore unconditionally: one rule, no dependence on
-                        # the chunk count. With a single chunk this is a
-                        # self-copy of a few hundred KiB.
-                        self._mtp_restore_topk(saved_topk_per_chunk[ci])
-                    if self.advance_draft_positions:
-                        loop_positions[ci] = loop_positions[ci] + 1
-                    # Prev step's [p] tokens feed directly — already bucketed.
-                    loop_input_ids = draft_tokens_per_chunk[ci][-1]
-                    last_hidden, hidden = self._forward_draft(
+                    fused = self._run_mtp_fused_loop(
                         chunk=chunk,
-                        input_ids=loop_input_ids,
-                        positions=loop_positions[ci],
-                        target_hidden_states=loop_hidden[ci],
-                        step_idx=step,
-                        seq_lens_delta=(step if self.advance_draft_positions else 0),
-                        num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
-                        num_tokens_padded=padded_nr_per_chunk[ci],
+                        input_ids=draft_tokens_per_chunk[ci][-1],
+                        positions=loop_positions[ci] + 1,
+                        hidden_states=loop_hidden[ci],
+                        num_rejected_np=rejected_np_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],
                         loop_query_start_loc=loop_qsl_per_chunk[ci],
                         loop_request_distribution=loop_reqdist_per_chunk[ci],
                     )
-                    with set_model_tag("eagle_head"):
-                        draft_tokens_per_chunk[ci].append(
-                            self._draft_propose_token(last_hidden)
-                        )
-                    loop_hidden[ci] = hidden
+                    if fused is not None:
+                        draft_tokens_per_chunk[ci].extend(fused)
+                        continue
+                    # This chunk's metadata doesn't fit the program.
+                    for step in range(1, K):
+                        run_draft_step(ci, step)
+            else:
+                # Separate: one draft forward and one lm-head per step.
+                for step in range(1, K):
+                    for ci in range(len(chunks)):
+                        if self._share_mtp_indices:
+                            # The loop is step-major, so chunks interleave and
+                            # each one finds the buffer holding its
+                            # predecessor's rows. Restore unconditionally: one
+                            # rule, no dependence on the chunk count. With a
+                            # single chunk this is a self-copy of a few
+                            # hundred KiB.
+                            self._mtp_restore_topk(saved_topk_per_chunk[ci])
+                        run_draft_step(ci, step)
 
         # EP-DP lockstep: pad this rank's draft-forward count up to the
         # step's coordinated chunk bound so ranks with fewer chunks still
@@ -1159,7 +1340,7 @@ class Eagle3Proposer:
     def _prepare_draft_inputs(
         self,
         chunk: DraftChunkInputs,
-        sampled_token_ids: list[list[int]],
+        sampled_token_ids: list[list[int]] | None,
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
         scheduler_output,
@@ -1307,6 +1488,7 @@ class Eagle3Proposer:
                     torch.tensor(ov_i, dtype=torch.long, device=runner.device)
                 ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
         else:
+            assert sampled_token_ids is not None
             num_rejected_out = num_rejected_np
             next_token_ids_np = np.zeros(num_reqs, dtype=np.int32)
             for i in range(num_reqs):
@@ -1372,6 +1554,108 @@ class Eagle3Proposer:
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
 
+    def _target_draft_attn_metadata(
+        self, chunk: DraftChunkInputs
+    ) -> dict[str, AttentionMetadata] | None:
+        """The draft layers' entries of the target forward's own metadata.
+
+        The target's walk in `_prepare_inputs` builds every KV cache group,
+        the draft layers' included, from the chunk's builder context. A step-0
+        rebuild would construct that same context and walk every group again
+        (one block-table upload plus, on the unified pool, every mamba group's
+        state-index gathers) only to keep the draft layers' entries. So these
+        entries are the step-0 metadata, and a loop step differs from them
+        only in seq_lens, query_start_loc and request_distribution: block
+        tables cannot change mid-propose, and draft layers are attention
+        layers, so no mamba field applies.
+
+        None when the chunk carries no target metadata (EP-DP dummy chunks,
+        standalone callers) or it does not cover every draft layer; the caller
+        then rebuilds. Also None for a KV-sharing draft (Gemma-4 MTP): it runs
+        inside the target's cache group and gets the group's full dict from
+        the rebuild, not just the draft layers' entries.
+        """
+        if self._draft_kv_shared:
+            return None
+        target_md = getattr(chunk, "attn_metadata", None)
+        if not target_md or chunk.attn_ctx.position_ids_override is not None:
+            return None
+        names = self._draft_attn_layer_names
+        assert names is not None, (
+            "draft attn layer names were not captured during load_model"
+        )
+        result = {name: md for name, md in target_md.items() if name in names}
+        if len(result) != len(names) or not all(
+            isinstance(md, AttentionMetadata) for md in result.values()
+        ):
+            return None
+        return result
+
+    def _loop_step_attn_inputs(
+        self,
+        chunk: DraftChunkInputs,
+        seq_lens_delta: int,
+        num_rejected_np: np.ndarray | None,
+        num_rejected_dev: torch.Tensor | None,
+        loop_query_start_loc: torch.Tensor | None,
+        loop_request_distribution: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """seq_lens, query_start_loc and request_distribution of a loop step
+        (one query per request), padded to the chunk's kernel_num_reqs."""
+        runner = self.runner
+        num_reqs = chunk.num_reqs
+        kernel_num_reqs = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert kernel_num_reqs is not None
+        # query_start_loc / request_distribution depend only on num_reqs;
+        # the loop hoists them across steps. Fall back to building them here
+        # when not supplied (keeps this helper usable standalone).
+        if loop_query_start_loc is not None:
+            query_start_loc = loop_query_start_loc
+        else:
+            qsl_np = np.arange(kernel_num_reqs + 1, dtype=np.int32)
+            qsl_np = np.minimum(qsl_np, num_reqs)
+            query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
+        # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
+        # [num_reqs:] gets the same delta / a zero subtraction but is ignored
+        # by the kernel (query_start_loc caps queries at num_reqs), so this
+        # stays correct while avoiding a per-num_reqs slice-assign that
+        # recompiles as the batch shrinks. (`+` returns a fresh tensor, so
+        # chunk.attn_ctx.seq_lens is not mutated — no .clone() needed.)
+        seq_lens = chunk.attn_ctx.seq_lens + seq_lens_delta
+        # ALWAYS subtract a (possibly all-zero) num_rejected so this metadata
+        # program is ONE shape — the variant WITH a num_rejected operand —
+        # regardless of whether this step actually had rejections. The spec
+        # warmup's synthetic request is all-accept (dummy logits ->
+        # draft==target -> zero rejections), so it only ever exercised the
+        # add-only branch; the sub-with-num_rejected variant then recompiled
+        # cold on the first real serving rejection (the residual tt_jit_sub at
+        # the first reject step). Subtracting zeros is value-identical to the
+        # add-only path, and building num_rejected via from_numpy().to(device)
+        # keeps it a runtime PARAMETER (matching the real-rejection program),
+        # not a folded constant. num_rejected_dev (async) is already
+        # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
+        # (query_start_loc caps queries at num_reqs).
+        if num_rejected_dev is None:
+            padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
+            if num_rejected_np is not None:
+                padded_rej[:num_reqs] = num_rejected_np
+            num_rejected_dev = torch.from_numpy(padded_rej).to(runner.device)
+        seq_lens = seq_lens - num_rejected_dev
+        # Pure decode distribution; matches precompile loop-step shape.
+        if loop_request_distribution is not None:
+            request_distribution = loop_request_distribution
+        else:
+            request_distribution = torch.tensor(
+                [num_reqs, num_reqs, num_reqs],
+                dtype=torch.int32,
+                device=runner.device,
+            )
+        return seq_lens, query_start_loc, request_distribution
+
     def _build_draft_attn_metadata(
         self,
         chunk: DraftChunkInputs,
@@ -1393,23 +1677,21 @@ class Eagle3Proposer:
         num_reqs = chunk.num_reqs
         chunk_ctx = chunk.attn_ctx
 
-        # Loop-step metadata reuse: between loop iterations of one step the
-        # metadata is identical except seq_lens (+1 per iteration) — qsl and
+        # Loop steps >= 2 reuse the chunk's previous loop step: qsl and
         # request_distribution are hoisted, block tables can't change
-        # mid-propose, shapes are fixed.
-        cacheable = (
-            step_idx >= 1
-            and not runner._has_mamba_state
-            and not runner._unified_kv_layout
-            and chunk_ctx.position_ids_override is None
-        )
-        if cacheable and step_idx >= 2:
+        # mid-propose and shapes are fixed, so only seq_lens differs. Both
+        # paths below cache a step only where that holds.
+        if step_idx >= 2:
             cached = self._draft_md_cache.get(id(chunk))
             if cached is not None:
-                md_dict, prev_seq_lens = cached
-                # base + (s-1) - rejected, advanced by 1 == base + s - rejected:
-                # value-identical to the full rebuild below.
-                new_seq_lens = prev_seq_lens + 1
+                md_dict, prev_seq_lens, prev_delta = cached
+                # base + prev_delta - rejected, moved by the delta's change, is
+                # base + seq_lens_delta - rejected: value-identical to building
+                # it. The change is +1 for a draft that appends a token per
+                # step and 0 for one that re-reads the target's prefix.
+                if seq_lens_delta == prev_delta:
+                    return md_dict
+                new_seq_lens = prev_seq_lens + (seq_lens_delta - prev_delta)
                 replaced: dict[int, object] = {}
                 new_md = {}
                 for lname, md in md_dict.items():
@@ -1418,8 +1700,55 @@ class Eagle3Proposer:
                             md, seq_lens=new_seq_lens
                         )
                     new_md[lname] = replaced[id(md)]
-                self._draft_md_cache[id(chunk)] = (new_md, new_seq_lens)
+                self._draft_md_cache[id(chunk)] = (
+                    new_md,
+                    new_seq_lens,
+                    seq_lens_delta,
+                )
                 return new_md
+
+        target_md = self._target_draft_attn_metadata(chunk)
+        if target_md is not None:
+            if step_idx == 0:
+                return target_md
+            seq_lens, query_start_loc, request_distribution = (
+                self._loop_step_attn_inputs(
+                    chunk,
+                    seq_lens_delta=seq_lens_delta,
+                    num_rejected_np=num_rejected_np,
+                    num_rejected_dev=num_rejected_dev,
+                    loop_query_start_loc=loop_query_start_loc,
+                    loop_request_distribution=loop_request_distribution,
+                )
+            )
+            replaced_target: dict[int, AttentionMetadata] = {}
+            result = {}
+            for name, md in target_md.items():
+                if id(md) not in replaced_target:
+                    # AttentionMetadata annotates these fields with the
+                    # kernels' jax.Array; the runner fills them with torch
+                    # tensors, as every builder of it does.
+                    replaced_target[id(md)] = dataclasses.replace(
+                        md,
+                        # pyrefly: ignore[bad-argument-type]
+                        seq_lens=seq_lens,
+                        # pyrefly: ignore[bad-argument-type]
+                        query_start_loc=query_start_loc,
+                        # pyrefly: ignore[bad-argument-type]
+                        request_distribution=request_distribution,
+                    )
+                result[name] = replaced_target[id(md)]
+            self._draft_md_cache[id(chunk)] = (result, seq_lens, seq_lens_delta)
+            return result
+
+        # The rebuilt metadata is cached for the loop steps after it, except
+        # on hybrid models and EP-DP dummy chunks (fixed positions).
+        cacheable = (
+            step_idx >= 1
+            and not runner._has_mamba_state
+            and not runner._unified_kv_layout
+            and chunk_ctx.position_ids_override is None
+        )
 
         use_max_model_len = chunk_ctx.use_max_model_len
         kernel_num_reqs = (
@@ -1427,6 +1756,7 @@ class Eagle3Proposer:
             if use_max_model_len
             else runner.num_reqs_most_model_len
         )
+        assert kernel_num_reqs is not None
 
         if step_idx == 0:
             seq_lens = chunk_ctx.seq_lens
@@ -1438,50 +1768,16 @@ class Eagle3Proposer:
             max_query_len = 1
         else:
             num_tokens = num_reqs
-            # query_start_loc / request_distribution depend only on num_reqs;
-            # the loop hoists them across steps. Fall back to building them here
-            # when not supplied (keeps this helper usable standalone).
-            if loop_query_start_loc is not None:
-                query_start_loc = loop_query_start_loc
-            else:
-                qsl_np = np.arange(kernel_num_reqs + 1, dtype=np.int32)
-                qsl_np = np.minimum(qsl_np, num_reqs)
-                query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
-            # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
-            # [num_reqs:] gets the same delta / a zero subtraction but is ignored
-            # by the kernel (query_start_loc caps queries at num_reqs), so this
-            # stays correct while avoiding a per-num_reqs slice-assign that
-            # recompiles as the batch shrinks. (`+` returns a fresh tensor, so
-            # chunk_ctx.seq_lens is not mutated — no .clone() needed.)
-            seq_lens = chunk_ctx.seq_lens + seq_lens_delta
-            # ALWAYS subtract a (possibly all-zero) num_rejected so this metadata
-            # program is ONE shape — the variant WITH a num_rejected operand —
-            # regardless of whether this step actually had rejections. The spec
-            # warmup's synthetic request is all-accept (dummy logits ->
-            # draft==target -> zero rejections), so it only ever exercised the
-            # add-only branch; the sub-with-num_rejected variant then recompiled
-            # cold on the first real serving rejection (the residual tt_jit_sub at
-            # the first reject step). Subtracting zeros is value-identical to the
-            # add-only path, and building num_rejected via from_numpy().to(device)
-            # keeps it a runtime PARAMETER (matching the real-rejection program),
-            # not a folded constant. num_rejected_dev (async) is already
-            # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
-            # (query_start_loc caps queries at num_reqs).
-            if num_rejected_dev is None:
-                padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
-                if num_rejected_np is not None:
-                    padded_rej[:num_reqs] = num_rejected_np
-                num_rejected_dev = torch.from_numpy(padded_rej).to(runner.device)
-            seq_lens = seq_lens - num_rejected_dev
-            # Pure decode distribution; matches precompile loop-step shape.
-            if loop_request_distribution is not None:
-                request_distribution = loop_request_distribution
-            else:
-                request_distribution = torch.tensor(
-                    [num_reqs, num_reqs, num_reqs],
-                    dtype=torch.int32,
-                    device=runner.device,
+            seq_lens, query_start_loc, request_distribution = (
+                self._loop_step_attn_inputs(
+                    chunk,
+                    seq_lens_delta=seq_lens_delta,
+                    num_rejected_np=num_rejected_np,
+                    num_rejected_dev=num_rejected_dev,
+                    loop_query_start_loc=loop_query_start_loc,
+                    loop_request_distribution=loop_request_distribution,
                 )
+            )
             max_query_len = 1
 
         effective_num_tokens = num_tokens_padded if num_tokens_padded else num_tokens
@@ -1556,7 +1852,7 @@ class Eagle3Proposer:
             }
 
         if cacheable:
-            self._draft_md_cache[id(chunk)] = (result, seq_lens)
+            self._draft_md_cache[id(chunk)] = (result, seq_lens, seq_lens_delta)
 
         return result
 
@@ -1608,7 +1904,7 @@ class Eagle3Proposer:
 
         num_tokens = input_ids.shape[0]
 
-        kwargs = {
+        kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
             "positions": positions,
             "hidden_states": target_hidden_states,
@@ -1674,6 +1970,7 @@ class Eagle3Proposer:
         (`backbone_hidden_size`) is the TARGET's, not the draft's. Fall back
         to vLLM's already-resolved text config for those.
         """
+        assert self.draft_model is not None
         hidden_size = getattr(self.draft_model.config, "hidden_size", None)
         if hidden_size is None:
             hidden_size = (
@@ -1687,6 +1984,7 @@ class Eagle3Proposer:
         """
         if self.speculative_config.method == "mtp":
             return False
+        assert self.draft_model is not None
         return bool(getattr(self.draft_model.model, "use_aux_hidden_state", True))
 
     def _draft_combine_input_size(self) -> int:
@@ -1697,6 +1995,7 @@ class Eagle3Proposer:
         hidden_size-wide target hidden state, so the input width is just hidden_size.
         """
         if self._draft_uses_aux_hidden_state():
+            assert self.draft_model is not None
             return self.draft_model.model.fc_input_size
         return self._draft_hidden_size()
 
@@ -1848,6 +2147,7 @@ class Eagle3Proposer:
         if num_chunks * K == 0:
             return
         bucket = runner._dp_target_bucket
+        assert bucket is not None, "_dp_target_bucket unset in lockstep step"
         num_reqs = runner.num_reqs_max_model_len
         input_ids = torch.zeros(bucket, dtype=torch.int32, device=runner.device)
         # Two consumers, two ranks. The draft forward takes mrope-shaped
@@ -1928,6 +2228,8 @@ class Eagle3Proposer:
         # combine_hidden_states at all, so replaying one here would both
         # crash and add a step the real trace does not have.
         combines_plain = not uses_aux and (self.speculative_config.method == "eagle3")
+        combine_aux: list[torch.Tensor] = []
+        combine_plain: torch.Tensor | None = None
         if uses_aux:
             aux_width = self._draft_combine_input_size() // 3
             combine_aux = [
@@ -1947,6 +2249,7 @@ class Eagle3Proposer:
                     if uses_aux:
                         self._draft_combine_hidden_states(*combine_aux)
                     else:
+                        assert self.draft_model is not None
                         self.draft_model.combine_hidden_states(combine_plain)
             last_hidden, _ = self._forward_draft(
                 chunk=chunk,

@@ -15,7 +15,9 @@
 
 import functools
 import math
+from collections.abc import Sequence
 from enum import Enum
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -153,8 +155,8 @@ def static_validate_inputs(
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
-    num_kv_pages_per_blocks: tuple[int, int, int] | None = None,
-    num_queries_per_blocks: tuple[int, int, int] | None = None,
+    num_kv_pages_per_blocks: Sequence[int] | None = None,
+    num_queries_per_blocks: Sequence[int] | None = None,
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
     mixed_q_split: int = 1,
@@ -346,7 +348,7 @@ def _mla_ragged_paged_attention_kernel(
     m_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, lkv_dim],
     *,
-    static_q_len: int,
+    static_q_len: int | None,
     sm_scale: float,
     mask_value: float,
     s_dtype: jnp.dtype,
@@ -1646,7 +1648,7 @@ def _mla_ragged_paged_attention_kernel(
                     wait,
                 )
 
-    # TODO(b/506245022): Split out the KV handling functions into separate files.
+    # TODO: Split out the KV handling functions into separate files.
     _fetch_bkv_fn = _fetch_bkv if not transpose_kv_cache else _fetch_transposed_bkv
 
     def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
@@ -1679,7 +1681,7 @@ def _mla_ragged_paged_attention_kernel(
         def _():
             _send_bo(old_batch_start_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
-    # TODO(b/506245022): Split out the KV handling functions into separate files.
+    # TODO: Split out the KV handling functions into separate files.
     def start_update_kv_cache(start_seq_idx, bkv_sem_idx, offsets, update_szs):
         for b in range(batch_size):
             offset = offsets[b]
@@ -1885,7 +1887,7 @@ def _mla_ragged_paged_attention_kernel(
                     batch_start_seq_idx, bkv_idx, bkv_sem_idx
                 )
 
-                # TODO(b/506245022): Split out the KV handling functions into separate
+                # TODO: Split out the KV handling functions into separate
                 # files.
                 # Pack and align new KVs in VMEM if the block has new KVs.
                 # We may have to do this for each block of KV in VMEM.
@@ -1906,7 +1908,7 @@ def _mla_ragged_paged_attention_kernel(
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
-                # TODO(b/506245022): Split out the KV handling functions into separate
+                # TODO: Split out the KV handling functions into separate
                 # files.
                 if not transpose_kv_cache:
                     load_bkv_fn = load_bkv
@@ -2372,7 +2374,7 @@ def mla_ragged_paged_attention(
       The output of attention and the updated kv cache.
     """
     if mask_value is None:
-        mask_value = jnp.finfo(s_dtype).min
+        mask_value = cast(float, jnp.finfo(s_dtype).min)
 
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         raise ValueError(
@@ -2606,7 +2608,7 @@ def mla_ragged_paged_attention(
                     sm_scale=sm_scale,
                     sliding_window=sliding_window,
                     soft_cap=soft_cap,
-                    mask_value=mask_value,
+                    mask_value=cast(float, mask_value),
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
