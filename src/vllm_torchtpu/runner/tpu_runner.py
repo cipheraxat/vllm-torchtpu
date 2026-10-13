@@ -128,6 +128,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     attention_block_table_width,
+    pcp_metadata_kwargs,
     stage_block_table_uploads,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -143,6 +144,11 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
+from vllm_torchtpu.runner.pcp_manager import (
+    PcpKvGatherPlan,
+    dummy_pcp_kv_gather_fields,
+    pcp_kv_gather_fields,
+)
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
     maybe_create_mm_encoder_manager,
@@ -2910,6 +2916,21 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    def _dummy_pcp_kv_gather_fields(self, plan: Any, num_tokens: int, num_reqs: int):
+        """PCP manager metadata fields for a dummy run, or None."""
+        if not isinstance(plan, PcpKvGatherPlan):
+            return None
+        pcp_size = plan.global_padded_num_tokens // max(plan.local_padded_num_tokens, 1)
+        return dummy_pcp_kv_gather_fields(
+            num_tokens,
+            num_reqs,
+            pcp_size,
+            self.sequence_layout_planner.dcp_size,
+            self.sequence_layout_planner.num_ws_pages,
+            pcp_size * int(self.num_tokens_paddings[-1]),
+            self.device,
+        )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3089,6 +3110,9 @@ class TPUModelRunner(GPUModelRunner):
             padded_num_reqs=padded_num_reqs,
         )
         self._last_sequence_layout_plan = layout_plan
+        # PCP manager: the forward runs this rank's local requests.
+        pcp_plan = layout_plan if isinstance(layout_plan, PcpKvGatherPlan) else None
+        meta_num_reqs = num_reqs if pcp_plan is None else pcp_plan.local_num_reqs
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
@@ -3267,10 +3291,16 @@ class TPUModelRunner(GPUModelRunner):
             # no dedicated prefill-only bucket, and all remaining requests in
             # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+            rd_num_reqs = num_reqs
+            if pcp_plan is not None:
+                # The main metadata covers the split prefills; decodes carry
+                # their own request window (`pcp_rep_*`).
+                chunk_num_decode = 0
+                rd_num_reqs = pcp_plan.local_num_split_reqs
             if self.mamba_slot_read_offsets is None:
                 self._request_distribution_cpu[0] = chunk_num_decode
                 self._request_distribution_cpu[1] = chunk_num_decode
-                self._request_distribution_cpu[2] = num_reqs
+                self._request_distribution_cpu[2] = rd_num_reqs
                 request_distribution = self._request_distribution_cpu.to(
                     self.device, non_blocking=True
                 )
@@ -3331,12 +3361,20 @@ class TPUModelRunner(GPUModelRunner):
         assert request_distribution is not None
 
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
-            num_reqs=num_reqs,
+            num_reqs=meta_num_reqs,
             start_index=start_index,
             use_max_model_len=use_max_model_len,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            block_table_rows=(
+                None if pcp_plan is None else pcp_plan.local_block_rows
+            ),
+            pcp_kv_gather=(
+                None
+                if pcp_plan is None
+                else pcp_kv_gather_fields(pcp_plan, self.device)
+            ),
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -5535,6 +5573,9 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
+                pcp_kv_gather=self._dummy_pcp_kv_gather_fields(
+                    dummy_layout_plan, num_tokens, num_reqs
+                ),
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -5559,12 +5600,27 @@ class TPUModelRunner(GPUModelRunner):
             block_tables = torch.zeros((num_reqs * num_blocks,), dtype=torch.int32).to(
                 self.device
             )
+            dummy_pcp_fields = self._dummy_pcp_kv_gather_fields(
+                dummy_layout_plan, num_tokens, num_reqs
+            )
             attn_metadata = AttentionMetadata(
                 input_positions=position_ids,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
+                **(
+                    {}
+                    if dummy_pcp_fields is None
+                    else pcp_metadata_kwargs(
+                        dummy_pcp_fields,
+                        split_block_tables=block_tables,
+                        rep_block_tables=torch.zeros(
+                            (dummy_pcp_fields.rep_window * num_blocks,),
+                            dtype=torch.int32,
+                        ).to(self.device),
+                    )
+                ),
                 sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
                 sequence_layout_protocol=(dummy_layout_plan.descriptor.protocol),
                 sequence_layout_version=(dummy_layout_plan.descriptor.version),
