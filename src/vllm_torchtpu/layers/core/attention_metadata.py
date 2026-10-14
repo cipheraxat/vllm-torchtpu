@@ -429,6 +429,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            if self.block_tables_cpu.shape[0] < target_num_reqs:
+                # A sequence layout's request bucket can outgrow
+                # `max_num_reqs` (see `TPUModelRunner.max_num_local_reqs`).
+                self.block_tables_cpu = torch.zeros(
+                    (target_num_reqs, self.block_tables_cpu.shape[1]),
+                    dtype=self.block_tables_cpu.dtype,
+                )
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
             source_block_tables = block_table_obj.get_cpu_tensor()
