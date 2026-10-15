@@ -38,6 +38,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     dcp_sc_compact,
     metadata,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    components as indexing,
+)
 
 try:
     from vllm_torchtpu.logger import init_logger
@@ -209,6 +212,7 @@ def kernel(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    components: indexing.StreamIndexComponents | None = None,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -231,7 +235,9 @@ def kernel(
             kv_packing,
             _,
         ) = cache_kv_hbm_ref.shape
-        page_size = page_size_per_kv_packing * kv_packing
+        page_size = page_size_per_kv_packing * (
+            kv_packing if components is None else components.keys.packing
+        )
         kv_sublane_groups = None
         kv_head_dim_groups = None
 
@@ -524,12 +530,20 @@ def kernel(
             # Offset of this block's first token within the sequence.
             block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
             q_pos = s_l - q_l + block_start + jnp.arange(bq_sz, dtype=jnp.int32)
+            if components is not None:
+                q_pos = components.schedule.positions(q_pos)
             bq_pos_compressed_vec.append(q_pos >> shift_comp)
 
         bkvs = []
         bkv_scales = []
         for batch_idx in range(seq_batch_size):
-            if seq_along_lane:
+            if components is not None:
+                keys, scales = components.keys.read(
+                    bkv_vmem.at[batch_idx], bkv_sz, head_dim
+                )
+                bkvs.append(keys)
+                bkv_scales.append(scales)
+            elif seq_along_lane:
                 # Keys and scales come straight out of the packed block in their MXU
                 # and lane layouts respectively; see `seq_along_lane_block_rows`.
                 rows = seq_along_lane_block_rows(bkv_vmem)
@@ -654,9 +668,17 @@ def kernel(
                 )
 
         else:
-            groups_per_chunk = lane_chunk // kv_packing
+            groups_per_chunk = lane_chunk // (
+                kv_packing if components is None else components.keys.packing
+            )
 
             def load_chunk(c):
+                if components is not None:
+                    return components.keys.read(
+                        bkv_vmem.at[0, pl.ds(c * groups_per_chunk, groups_per_chunk)],
+                        lane_chunk,
+                        head_dim,
+                    )
                 blk = bkv_vmem[0, pl.ds(c * groups_per_chunk, groups_per_chunk)]
                 flat = blk.reshape(lane_chunk, blk.shape[-1])
                 keys = pltpu.bitcast(flat[:, :head_dim], jnp.float8_e4m3fn)
@@ -1023,6 +1045,7 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    components: indexing.StreamIndexComponents | None = None,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
@@ -1040,8 +1063,12 @@ def _effective_row_lengths(
     q_len = cu_q_lens[seq_ids + 1] - q_start
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
+    if components is not None:
+        token_pos = components.schedule.positions(token_pos)
     kv_len = seq_len // compression_ratio
     visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    if components is not None:
+        visible = components.schedule.visible_lengths(visible)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
@@ -1063,6 +1090,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "components",
     ),
 )
 def streamindex_topk(
@@ -1091,6 +1119,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    components: indexing.StreamIndexComponents | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1150,6 +1179,9 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+
+      components: Optional static key reader and schedule. None retains the
+        original packed-key reader and metadata traversal.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1224,6 +1256,9 @@ def streamindex_topk(
     prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
     q = prepare_q_inputs(q)
     head_dim = q.shape[-1]
+    if components is not None:
+        components.keys.validate(cache_kv, head_dim, kv_layout)
+        components.schedule.validate(compression_ratio)
 
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
@@ -1242,7 +1277,9 @@ def streamindex_topk(
             )
     else:
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
-        page_size = page_size_per_kv_packing * kv_packing
+        page_size = page_size_per_kv_packing * (
+            kv_packing if components is None else components.keys.packing
+        )
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
     for bkv_p in num_kv_pages_per_blocks:
@@ -1355,6 +1392,7 @@ def streamindex_topk(
                     cp_size=cp_size,
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
+                    components=components,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -1480,8 +1518,12 @@ def streamindex_topk(
                 seq_lens,
                 page_indices,
                 cu_q_lens,
-                pass_meta=pass_meta,
-                chunk_idx=chunk_idx,
+                pass_meta=(
+                    pass_meta
+                    if components is None
+                    else components.schedule.chunk_metadata(pass_meta, chunk_idx)
+                ),
+                chunk_idx=chunk_idx if components is None else 0,
                 chunk_token_start=chunk_token_start,
                 chunk_tokens=chunk_tokens,
                 out_dtype=out_dtype,
@@ -1518,6 +1560,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            components=components,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1618,6 +1661,8 @@ def streamindex_topk(
         q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
         q_start = cu_q_lens[seq_idx]
         q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
+        if components is not None:
+            q_abs_pos = components.schedule.positions(q_abs_pos)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
             q_abs_pos // compression_ratio,
