@@ -1669,13 +1669,8 @@ def test_pooled_conv_format_is_declared_without_changing_ssm_dtype(conv_dtype):
         assert attn.get_state_dtype() == (conv_dtype, torch.float32)
 
 
-@pytest.mark.parametrize(
-    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
-)
 def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
     cpu_vllm_config_context,
-    ssm_cache_dtype,
-    ssm_dtype,
 ):
     captured = []
 
@@ -1688,19 +1683,25 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
         set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
         patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
     ):
-        for index, dtype in enumerate(
-            (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32)
-        ):
-            attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
-            attn._pooled_conv_state_dtype = dtype
-            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
-            attn._build_pooled_gdn_op()
+        for ssm_cache_dtype in ("bfloat16", "float32"):
+            for index, dtype in enumerate(
+                (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32)
+            ):
+                attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
+                attn._pooled_conv_state_dtype = dtype
+                attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+                attn._build_pooled_gdn_op()
 
-    assert len(captured) == 2
-    assert captured[0][0] != captured[1][0]
+    assert len(captured) == 4
+    assert len({name for name, _ in captured}) == 4
     operands = [torch.zeros((1, 1)) for _ in range(12)]
     operands[5] = None
-    for (_, function), dtype in zip(captured, (jnp.bfloat16, jnp.float32)):
+    formats = [
+        (conv, ssm)
+        for ssm in (jnp.bfloat16, jnp.float32)
+        for conv in (jnp.bfloat16, jnp.float32)
+    ]
+    for (_, function), (dtype, ssm_dtype) in zip(captured, formats):
         with patch.object(
             gdn_attention_op,
             "gdn_attention_pooled_core_tpu",
@@ -1729,7 +1730,13 @@ def test_state_dtype_rejects_unsupported_formats(dtype):
         gdn_attention_op._to_jax_state_dtype(dtype)
 
 
-def test_pooled_input_preparation_separates_cached_ops(cpu_vllm_config_context):
+@pytest.mark.parametrize("conv_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
+)
+def test_pooled_input_preparation_separates_cached_ops(
+    cpu_vllm_config_context, conv_dtype, ssm_cache_dtype, ssm_dtype
+):
     from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
         VllmGatedDeltaNetAttention,
     )
@@ -1754,6 +1761,9 @@ def test_pooled_input_preparation_separates_cached_ops(cpu_vllm_config_context):
         ):
             attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
             attn.__class__ = cls
+            if conv_dtype is not None:
+                attn._pooled_conv_state_dtype = conv_dtype
+            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
             attn._build_pooled_gdn_op()
 
     assert len(captured) == 2
@@ -1768,3 +1778,51 @@ def test_pooled_input_preparation_separates_cached_ops(cpu_vllm_config_context):
         ) as dispatch:
             function(*operands)
         torch.testing.assert_close(dispatch.call_args.args[0], operands[0] + index)
+        if index == 0:
+            assert dispatch.call_args.args[0] is operands[0]
+        expected_conv = jnp.float32 if conv_dtype == torch.float32 else jnp.bfloat16
+        assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
+        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
+            ssm_dtype
+        )
+
+
+@pytest.mark.parametrize("conv_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
+)
+def test_pooled_pcp_wrapper_forwards_state_formats(
+    cpu_vllm_config_context, conv_dtype, ssm_cache_dtype, ssm_dtype
+):
+    attn = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+    if conv_dtype is not None:
+        attn._pooled_conv_state_dtype = conv_dtype
+    attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+    with (
+        set_vllm_model_wrapper_context(
+            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=2)
+        ),
+        patch.object(gdn_attention_op, "get_pcp_world_size", return_value=2),
+        patch.object(
+            gdn_attention_op,
+            "get_or_create_pcp_mesh",
+            return_value=SimpleNamespace(shape={"pcp": 2, "tp": 1}),
+        ),
+        patch.object(
+            gdn_attention_op.pallas, "jax_op", return_value=MagicMock()
+        ) as build,
+    ):
+        attn._build_pooled_pcp_gdn_op()
+    function = build.call_args.args[1]
+    operands = [torch.zeros((1, 1)) for _ in range(14)]
+    operands[6] = None
+    operands[13] = None
+    with patch.object(
+        gdn_attention_op,
+        "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+        return_value=(operands[4], operands[0], operands[0]),
+    ) as dispatch:
+        function(*operands)
+    expected_conv = jnp.float32 if conv_dtype == torch.float32 else jnp.bfloat16
+    assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
+    assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(ssm_dtype)
