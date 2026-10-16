@@ -286,16 +286,28 @@ def block_sparse_gqa_prefill(
             query_heads != 24
             or kv_heads != 2
             or head_dim != 256
-            or cache.dtype != jnp.float8_e4m3fn
+            or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
+            or (
+                cache.dtype == jnp.bfloat16
+                and (
+                    query_block != 256
+                    or physical_page_size not in (128, 1664)
+                    or (head_axis, packing, cache_dim) != (2, 2, 256)
+                    or pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X
+                )
+            )
             or query_block not in PAIRED_PAGE_VMEM_MIB
             or not bf16_io
         ):
-            raise ValueError("Paired pages require BF16 Q24/KV2/D256 with FP8 cache")
+            raise ValueError(
+                "Paired pages require BF16 Q24/KV2/D256 with FP8 cache, or "
+                "TPU7x BF16 cache with Q256 and page size 128/1664"
+            )
     elif kv_tile // ratio != 32 or max(physical_page_size, kv_tile) % min(
         physical_page_size, kv_tile
     ):
         raise ValueError(
-            "Each KV tile must use one selection word or two FP8 mask segments"
+            "Each KV tile must use one selection word or two mask segments"
         )
     if query_heads % kv_heads or cache_dim < head_dim:
         raise ValueError("QSA query and KV geometry is inconsistent")
@@ -311,7 +323,11 @@ def block_sparse_gqa_prefill(
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
     native_query_width = ((query_block + 127) // 128) * 128
-    if paired_pages and query_block == 256 and tokens * words * 4 >= 16 * 1024**2:
+    if (
+        (paired_pages or cache.dtype == jnp.bfloat16)
+        and query_block == 256
+        and tokens * words * 4 >= 16 * 1024**2
+    ):
         batch = 8
         while batch > 1 and batch * query_block * words * 4 >= 16 * 1024**2:
             batch //= 2
@@ -425,7 +441,7 @@ def block_sparse_gqa_prefill(
         # tile can serve twice as many queries.  The compiled production
         # kernel needs about 40.44 MB at the full T8192 production shape, just
         # above the effective limit produced by a 36 MiB setting.
-        # Paired pages need 61.13 MiB at Q256 on v7; the tuned allowance
+        # FP8 paired pages need 61.13 MiB at Q256 on v7; the tuned allowance
         # remains below its 64 MiB per core. Preserve the KV128 budgets.
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),

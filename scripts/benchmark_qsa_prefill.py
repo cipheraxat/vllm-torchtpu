@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare QSA prefill with unchanged batched RPA on identical selected tokens.
+"""Compare paired-page QSA prefill with RPA or single-page prefill.
 
 Run on an allocated TPU with the repository's pinned dependencies:
   PYTHONPATH=src python scripts/benchmark_qsa_prefill.py --output /tmp/qsa-prefill
+
+For BF16 paired-page A/B, add --cache-dtype bfloat16 --baseline kv128.
 
 Includes selection metadata, attention and output gating; excludes the indexer,
 cache writes, compilation and warmup. Does not benchmark decode or a model.
@@ -163,14 +165,22 @@ def rpa_attention(
     return output.reshape(-1, *q.shape[1:])[: len(q)], cache
 
 
-def case(tokens: int, context: int, pattern: str) -> tuple[jax.Array, ...]:
+def case(
+    tokens: int,
+    context: int,
+    pattern: str,
+    *,
+    page_size: int = 1664,
+    cache_dtype: str = "float8_e4m3fn",
+) -> tuple[jax.Array, ...]:
     rng = np.random.default_rng(1964)
-    page_size = 1664
+    packing = 2 if cache_dtype == "bfloat16" else 4
+    dtype = jnp.bfloat16 if packing == 2 else jnp.float8_e4m3fn
     pages = (context + tokens + page_size - 1) // page_size
     query = jnp.asarray(rng.normal(0, 0.3, (tokens, 24, 256)), jnp.bfloat16)
     gate = jnp.asarray(rng.uniform(-3, 3, query.shape), jnp.bfloat16)
     cache = jnp.asarray(
-        rng.normal(0, 0.3, (pages, page_size, 1, 4, 256)), jnp.float8_e4m3fn
+        rng.normal(0, 0.3, (pages, page_size, 4 // packing, packing, 256)), dtype
     )
     lengths = context + np.arange(1, tokens + 1, dtype=np.int32)
     blocks = np.full((tokens, 512), -1, np.int32)
@@ -213,6 +223,11 @@ def main() -> None:
         default=["recent", "uniform"],
     )
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument(
+        "--cache-dtype", choices=["float8_e4m3fn", "bfloat16"], default="float8_e4m3fn"
+    )
+    parser.add_argument("--page-size", type=int, choices=[128, 1664], default=1664)
+    parser.add_argument("--baseline", choices=["rpa", "kv128"], default="rpa")
     args = parser.parse_args()
     assert args.iterations >= 3
     args.output.mkdir(parents=True, exist_ok=False)
@@ -225,7 +240,17 @@ def main() -> None:
         cases=[],
     )
     functions = {
-        "rpa": jax.jit(baseline),
+        args.baseline: jax.jit(baseline)
+        if args.baseline == "rpa"
+        else jax.jit(
+            functools.partial(
+                block_sparse_gqa_attention,
+                kv_heads=2,
+                ratio=4,
+                query_block=256,
+                kv_tile=128,
+            )
+        ),
         "prefill": jax.jit(
             functools.partial(
                 block_sparse_gqa_attention,
@@ -242,7 +267,13 @@ def main() -> None:
                 name = f"t{tokens}-c{context}-{pattern}"
                 directory = args.output / name
                 directory.mkdir()
-                inputs = case(tokens, context, pattern)
+                inputs = case(
+                    tokens,
+                    context,
+                    pattern,
+                    page_size=args.page_size,
+                    cache_dtype=args.cache_dtype,
+                )
                 compiled = {}
                 outputs = {}
                 for arm, fn in functions.items():
@@ -250,7 +281,7 @@ def main() -> None:
                     (directory / f"{arm}.hlo.txt").write_text(compiled[arm].as_text())
                     for _ in range(3):
                         outputs[arm] = jax.block_until_ready(compiled[arm](*inputs))[0]
-                reference = np.asarray(outputs["rpa"], np.float32)
+                reference = np.asarray(outputs[args.baseline], np.float32)
                 actual = np.asarray(outputs["prefill"], np.float32)
                 assert np.isfinite(reference).all() and np.isfinite(actual).all()
                 relative_l2 = float(
@@ -285,13 +316,14 @@ def main() -> None:
                     head_dim=256,
                     ratio=4,
                     topk=512,
-                    page_size=1664,
-                    cache_dtype="float8_e4m3fn",
+                    page_size=args.page_size,
+                    cache_dtype=args.cache_dtype,
+                    baseline=args.baseline,
                     query_dtype="bfloat16",
                     relative_l2=relative_l2,
                     samples_ms=samples,
                     median_ms=medians,
-                    speedup=medians["rpa"] / medians["prefill"],
+                    speedup=medians[args.baseline] / medians["prefill"],
                 )
                 report["cases"].append(row)
                 (args.output / "results.json").write_text(

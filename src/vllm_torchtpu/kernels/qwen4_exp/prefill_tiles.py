@@ -8,7 +8,7 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Query block -> scoped VMEM MiB. Q256/KV256 compiles to 61.13 MiB on v7;
+# Query block -> scoped VMEM MiB. FP8 Q256/KV256 compiles to 61.13 MiB on v7;
 # Q128 is retained for environments where the full graph cannot spare 62 MiB.
 PAIRED_PAGE_VMEM_MIB = {128: 61, 256: 62}
 
@@ -18,6 +18,7 @@ PAIRED_PAGE_VMEM_MIB = {128: 61, 256: 62}
 # latency 22-37% relative to Q256/KV128 with FP32 attention accumulation.
 # The unified serving pool uses 1664-token pages (13 mask segments);
 # dedicated attention caches use 128. Both require segment-wise addressing.
+# BF16 uses the same paired tiles with native two-value packing.
 SPARSE_PREFILL_TILES = {
     (
         pltpu.ChipVersion.TPU_7X,
@@ -26,11 +27,12 @@ SPARSE_PREFILL_TILES = {
         2,
         256,
         4,
-        (page_size, 1, 4, 256),
+        (page_size, 4 // packing, packing, 256),
         "bfloat16",
-        "float8_e4m3fn",
+        cache_dtype,
     ): (256, 256)
     for page_size in (128, 1664)
+    for cache_dtype, packing in (("float8_e4m3fn", 4), ("bfloat16", 2))
 }
 
 
