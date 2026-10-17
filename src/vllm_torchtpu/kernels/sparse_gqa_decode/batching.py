@@ -36,9 +36,12 @@ def attend_in_chunks(
     lengths: jax.Array,
     table: jax.Array,
     cache: jax.Array,
+    *,
+    batch_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Bound per-launch SMEM use while preserving cache donation and row order."""
-    batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
+    if batch_size is None:
+        batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     if len(q) <= batch_size:
         return attend(q, gate, blocks, lengths, table, cache)
     padding = (-len(q)) % batch_size

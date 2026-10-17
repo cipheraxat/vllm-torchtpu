@@ -21,6 +21,7 @@ import argparse
 import functools
 import importlib.metadata
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -32,23 +33,33 @@ import numpy as np
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention, rpa_attention
 
 
-def make_case(batch: int, context: int, page: int, fp8: bool):
+def make_case(
+    batch: int,
+    context: int,
+    page: int,
+    fp8: bool,
+    heads: int,
+    kv_heads: int,
+    dim: int,
+    ratio: int,
+    groups: int,
+):
     rng = np.random.default_rng(721 + batch + context)
     columns = (context + page - 1) // page
     table = rng.permutation(batch * columns).reshape(batch, columns).astype(np.int32)
     lengths = context - np.arange(batch, dtype=np.int32) % 4
-    blocks = np.full((batch, 512), -1, np.int32)
+    blocks = np.full((batch, groups), -1, np.int32)
     for row, length in enumerate(lengths):
-        n = min(length // 4, 512)
-        blocks[row, :n] = rng.choice(length // 4, n, replace=False)
-    q = jnp.asarray(rng.normal(0, 0.5, (batch, 24, 256)), jnp.bfloat16)
+        n = min(length // ratio, groups)
+        blocks[row, :n] = rng.choice(length // ratio, n, replace=False)
+    q = jnp.asarray(rng.normal(0, 0.5, (batch, heads, dim)), jnp.bfloat16)
     gate = jnp.asarray(rng.normal(0, 3, q.shape), jnp.bfloat16)
     dtype = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
     packing = 4 if fp8 else 2
     # Generate on device to avoid a many-GB temporary host FP64 allocation.
     cache = jax.random.uniform(
         jax.random.key(721),
-        (batch * columns, page, 4 // packing, packing, 256),
+        (batch * columns, page, math.ceil(2 * kv_heads / packing), packing, dim),
         minval=-0.5,
         maxval=0.5,
     ).astype(dtype)
@@ -70,6 +81,11 @@ def main():
     parser.add_argument("--contexts", type=int, nargs="+", default=[8192])
     parser.add_argument("--page-size", type=int, default=1664)
     parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--heads", type=int, default=24)
+    parser.add_argument("--kv-heads", type=int, default=2)
+    parser.add_argument("--dim", type=int, default=256)
+    parser.add_argument("--ratio", type=int, default=4)
+    parser.add_argument("--groups", type=int, default=512)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -88,8 +104,20 @@ def main():
             print("CASE", name, flush=True)
             directory = args.output / name
             directory.mkdir()
-            inputs = make_case(batch, context, args.page_size, args.fp8)
-            opts = dict(kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0)
+            inputs = make_case(
+                batch,
+                context,
+                args.page_size,
+                args.fp8,
+                args.heads,
+                args.kv_heads,
+                args.dim,
+                args.ratio,
+                args.groups,
+            )
+            opts = dict(
+                kv_heads=args.kv_heads, ratio=args.ratio, k_scale=1.0, v_scale=1.0
+            )
             starts = jnp.arange(batch + 1, dtype=jnp.int32)
             funcs = {
                 "rpa": functools.partial(rpa_attention, **opts),
@@ -140,6 +168,11 @@ def main():
                 context=context,
                 page_size=args.page_size,
                 cache_dtype=str(inputs[-1].dtype),
+                heads=args.heads,
+                kv_heads=args.kv_heads,
+                dim=args.dim,
+                ratio=args.ratio,
+                groups=args.groups,
                 median_us=medians,
                 samples_us=samples,
                 speedup=medians["rpa"] / medians["fused"],

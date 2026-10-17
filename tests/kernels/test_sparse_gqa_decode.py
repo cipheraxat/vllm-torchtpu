@@ -30,7 +30,19 @@ from vllm_torchtpu.kernels.sparse_gqa_decode import (
 )
 
 
-def _case(batch, context, page, fp8):
+def _case(
+    batch,
+    context,
+    page,
+    fp8,
+    heads=24,
+    kv_heads=2,
+    dim=256,
+    ratio=4,
+    groups=512,
+    *,
+    poison_packed_padding=False,
+):
     rng = np.random.default_rng(6317 + batch + page)
     dtype = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
     packing = 4 if fp8 else 2
@@ -39,17 +51,25 @@ def _case(batch, context, page, fp8):
     lengths = np.maximum(context - np.arange(batch) % 4, 0).astype(np.int32)
     if batch > 1:
         lengths[batch // 2] = 0
-    blocks = np.full((batch, 512), -1, np.int32)
+    blocks = np.full((batch, groups), -1, np.int32)
     for row, length in enumerate(lengths):
-        n = min(length // 4, 512)
-        blocks[row, :n] = rng.choice(length // 4, n, replace=False)
-    q = jnp.asarray(rng.normal(0, 0.5, (batch, 24, 256)), jnp.bfloat16)
+        n = min(length // ratio, groups)
+        blocks[row, :n] = rng.choice(length // ratio, n, replace=False)
+    q = jnp.asarray(rng.normal(0, 0.5, (batch, heads, dim)), jnp.bfloat16)
     gate = jnp.asarray(rng.normal(0, 3, q.shape), jnp.bfloat16)
     q = jnp.where(jnp.asarray(lengths)[:, None, None] > 0, q, jnp.nan)
     gate = jnp.where(jnp.asarray(lengths)[:, None, None] > 0, gate, jnp.nan)
     cache = jnp.asarray(
-        rng.normal(0, 0.4, (batch * columns, page, 4 // packing, packing, 256)), dtype
+        rng.normal(
+            0,
+            0.4,
+            (batch * columns, page, math.ceil(2 * kv_heads / packing), packing, dim),
+        ),
+        dtype,
     )
+    if poison_packed_padding:
+        flat = cache.reshape(*cache.shape[:2], -1, dim)
+        cache = flat.at[:, :, 2 * kv_heads :].set(jnp.nan).reshape(cache.shape)
     for row, length in enumerate(lengths):
         # All cache values beyond the actual context are poisoned, including
         # tokens in the final partially selected compression group.
@@ -82,11 +102,62 @@ def _case(batch, context, page, fp8):
 def test_qsa_decode_entry_matches_rpa_and_reference_without_cache_writes(
     batch, context, page, fp8
 ):
+    _check_case(batch, context, page, fp8)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize(
+    "batch,context,page,heads,kv_heads,dim,ratio,groups",
+    [
+        (3, 1027, 132, 12, 2, 128, 4, 128),
+        (3, 4099, 136, 16, 4, 256, 8, 256),
+        (3, 2051, 128, 8, 1, 128, 16, 64),
+        (3, 8195, 128, 24, 2, 512, 4, 1024),
+        (129, 7, 128, 12, 2, 128, 8, 1024),
+    ],
+)
+def test_generalized_decode_geometry(
+    batch, context, page, heads, kv_heads, dim, ratio, groups, fp8
+):
+    _check_case(batch, context, page, fp8, heads, kv_heads, dim, ratio, groups)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_decode_packed_padding_and_odd_budget(fp8):
+    _check_case(3, 155, 136, fp8, 8, 1, 128, 8, 17, poison_packed_padding=True)
+
+
+def _check_case(
+    batch,
+    context,
+    page,
+    fp8,
+    heads=24,
+    kv_heads=2,
+    dim=256,
+    ratio=4,
+    groups=512,
+    *,
+    poison_packed_padding=False,
+):
     if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
         pytest.skip("Measured fused decode schedule requires TPU7x")
-    args = _case(batch, context, page, fp8)
+    args = _case(
+        batch,
+        context,
+        page,
+        fp8,
+        heads,
+        kv_heads,
+        dim,
+        ratio,
+        groups,
+        poison_packed_padding=poison_packed_padding,
+    )
     ks, vs = (0.375, 2.5) if fp8 else (1.0, 1.0)
-    opts = dict(kv_heads=2, ratio=4, k_scale=ks, v_scale=vs)
+    opts = dict(kv_heads=kv_heads, ratio=ratio, k_scale=ks, v_scale=vs)
     host = tuple(np.asarray(x).copy() for x in args)
     reference, _ = jax.jit(functools.partial(rpa_attention, **opts))(*args)
     compiled = (
@@ -130,23 +201,25 @@ def test_qsa_decode_entry_matches_rpa_and_reference_without_cache_writes(
     ]:
         length = int(host[3][row])
         selected = (
-            host[2][row, : min(length // 4, 512), None] * 4 + np.arange(4)
+            host[2][row, : min(length // ratio, groups), None] * ratio
+            + np.arange(ratio)
         ).reshape(-1)
-        selected = np.r_[selected, np.arange(length // 4 * 4, length)]
+        selected = np.r_[selected, np.arange(length // ratio * ratio, length)]
         values = (
             host[5][host[4][row, selected // page], selected % page]
-            .reshape(-1, 4, 256)
+            .reshape(len(selected), -1, dim)[:, : 2 * kv_heads]
             .astype(np.float64)
         )
-        wanted = np.empty((24, 256), np.float64)
-        for head in range(2):
+        wanted = np.empty((heads, dim), np.float64)
+        per_kv = heads // kv_heads
+        for head in range(kv_heads):
             logits = (
-                host[0][row, head * 12 : (head + 1) * 12].astype(np.float64)
+                host[0][row, head * per_kv : (head + 1) * per_kv].astype(np.float64)
                 @ values[:, head * 2].T
-                * (ks / 16)
+                * (ks / math.sqrt(dim))
             )
             mass = np.exp(logits - logits.max(axis=1, keepdims=True))
-            wanted[head * 12 : (head + 1) * 12] = (
+            wanted[head * per_kv : (head + 1) * per_kv] = (
                 (mass / mass.sum(axis=1, keepdims=True)) @ values[:, head * 2 + 1] * vs
             )
         wanted *= 1 / (1 + np.exp(-host[1][row].astype(np.float64)))
@@ -195,7 +268,7 @@ def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
     changes = {
         "heads": (0, (8, 12, 256)),
         "page": (5, (158, 130, *args[5].shape[2:])),
-        "budget": (2, (8, 256)),
+        "budget": (2, (8, 0)),
         "batch": (0, (257, 24, 256)),
         "table": (4, (8, 0)),
     }
@@ -225,7 +298,7 @@ def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
     )
     args = _specs()
     if not supported:
-        args[0] = jax.ShapeDtypeStruct((8, 12, 256), jnp.bfloat16)
+        args[0] = jax.ShapeDtypeStruct((8, 25, 256), jnp.bfloat16)
         args[1] = args[0]
     used = []
 
@@ -308,3 +381,113 @@ def test_decode_eligibility_rejects_empty_or_overflowing_metadata(monkeypatch, c
     assert not is_supported_by_fused_decode(
         *args, kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0
     )
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize(
+    "heads,kv_heads,dim,ratio,groups",
+    [
+        (12, 2, 128, 4, 128),
+        (16, 4, 256, 8, 256),
+        (8, 1, 128, 16, 64),
+        (24, 2, 512, 4, 1024),
+    ],
+)
+def test_geometry_replaces_fixed_model_values(
+    monkeypatch, fp8, heads, kv_heads, dim, ratio, groups
+):
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    args = _specs(fp8)
+    packing = 32 // jax.dtypes.itemsize_bits(args[5].dtype)
+    shapes = [
+        (8, heads, dim),
+        (8, heads, dim),
+        (8, groups),
+        (8,),
+        (8, 158),
+        (158, 1664, math.ceil(2 * kv_heads / packing), packing, dim),
+    ]
+    args = [jax.ShapeDtypeStruct(shape, arg.dtype) for shape, arg in zip(shapes, args)]
+    assert is_supported_by_fused_decode(
+        *args, kv_heads=kv_heads, ratio=ratio, k_scale=1.0, v_scale=1.0
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unaligned_dim",
+        "nondividing_heads",
+        "ratio_tile",
+        "zero_ratio",
+        "small_ratio_smem",
+        "wide_kv_vmem",
+        "zero_kv_heads",
+        "kv_packing",
+        "smem",
+        "vmem",
+        "selected_overflow",
+    ],
+)
+def test_geometry_and_resource_limits(monkeypatch, case):
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    args = _specs()
+    ratio, kv_heads = 4, 2
+    if case in ("unaligned_dim", "nondividing_heads", "vmem"):
+        shape = {
+            "unaligned_dim": (8, 24, 64),
+            "nondividing_heads": (8, 25, 256),
+            "vmem": (8, 8192, 256),
+        }[case]
+        args[0] = args[1] = jax.ShapeDtypeStruct(shape, jnp.bfloat16)
+        args[5] = jax.ShapeDtypeStruct((*args[5].shape[:-1], shape[-1]), args[5].dtype)
+    elif case == "ratio_tile":
+        ratio = 3
+        args[5] = jax.ShapeDtypeStruct((158, 129, *args[5].shape[2:]), args[5].dtype)
+    elif case == "small_ratio_smem":
+        ratio = 2
+    elif case == "wide_kv_vmem":
+        kv_heads = 4
+        args[0] = args[1] = jax.ShapeDtypeStruct((8, 32, 512), jnp.bfloat16)
+        args[5] = jax.ShapeDtypeStruct((158, 1664, 4, 2, 512), jnp.bfloat16)
+    elif case == "zero_ratio":
+        ratio = 0
+    elif case == "zero_kv_heads":
+        kv_heads = 0
+    elif case == "kv_packing":
+        args[5] = jax.ShapeDtypeStruct((158, 1664, 3, 2, 256), args[5].dtype)
+    else:
+        groups = 2**30 if case == "selected_overflow" else 2**18
+        args[2] = jax.ShapeDtypeStruct((8, groups), jnp.int32)
+    assert not is_supported_by_fused_decode(
+        *args, kv_heads=kv_heads, ratio=ratio, k_scale=1.0, v_scale=1.0
+    )
+
+
+def test_launch_bound_tracks_selected_tiles_and_hardware(monkeypatch):
+    import dataclasses
+
+    from vllm_torchtpu.kernels.sparse_gqa_decode.planning import query_batch_size
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    normal = query_batch_size(512, 24, 256, 2, 4, 512, jnp.dtype(jnp.bfloat16))
+    large = query_batch_size(512, 24, 256, 2, 4, 2048, jnp.dtype(jnp.bfloat16))
+    assert normal == 64
+    assert 0 < large < normal
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: dataclasses.replace(
+            info, smem_capacity_bytes=info.smem_capacity_bytes // 4
+        ),
+    )
+    assert query_batch_size(512, 24, 256, 2, 4, 512, jnp.dtype(jnp.bfloat16)) < normal

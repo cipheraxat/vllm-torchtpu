@@ -14,19 +14,21 @@
 
 """Sparse decode adapter; shape/dtype eligibility is enforced by the public API."""
 
+import dataclasses
 import functools
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 from vllm_torchtpu.kernels.sparse_gqa_decode import schedule
 from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
 from vllm_torchtpu.kernels.sparse_gqa_decode.fused_kernel import decode_kernel
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metadata
-from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import DECODE_BLOCK
+from vllm_torchtpu.kernels.sparse_gqa_decode.planning import (
+    make_config,
+    query_batch_size,
+)
 
 
 def _attend(
@@ -36,31 +38,18 @@ def _attend(
     pages, kv_lens = virtual_page_metadata(
         blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
     )
-    cfgs = configs.RpaConfigs(
-        block=DECODE_BLOCK,
-        model=configs.ModelConfigs(
-            num_q_heads=heads,
-            num_kv_heads=kv_heads,
-            head_dim=dim,
-            sm_scale=dim**-0.5,
-            mask_value=float(jnp.finfo(jnp.float32).min),
-        ),
-        serve=configs.ServingConfigs(
-            num_seqs=batch,
-            page_size=ratio,
-            total_q_tokens=batch,
-            num_page_indices=pages.size,
-            dtype_q=jnp.dtype(jnp.float32),
-            dtype_out=jnp.dtype(jnp.float32),
-            dtype_kv=cache.dtype,
-            scale_k=k_scale,
-            scale_v=v_scale,
-            skip_kv_update=True,
-        ),
-        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
-        mode=configs.RpaCase.DECODE,
+    cfgs = make_config(
+        batch,
+        heads,
+        dim,
+        kv_heads,
+        ratio,
+        blocks.shape[1],
+        cache.dtype,
     )
-    # The supported Q24/KV2/D256 layout needs no head/dimension padding.
+    cfgs = dataclasses.replace(
+        cfgs, serve=dataclasses.replace(cfgs.serve, scale_k=k_scale, scale_v=v_scale)
+    )
     # Keep request order; the compact schedule omits inactive requests.
     query = jnp.where((lengths > 0)[:, None, None], q, 0).astype(jnp.float32)
     query = query.reshape(batch, kv_heads, heads // kv_heads, 1, dim).swapaxes(0, 1)
@@ -104,4 +93,16 @@ def qsa_decode_attention(
     attend = functools.partial(
         _attend, kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale
     )
-    return attend_in_chunks(attend, q, gate, blocks, lengths, table, cache)
+    batch_size = query_batch_size(
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        kv_heads,
+        ratio,
+        blocks.shape[1],
+        cache.dtype,
+    )
+    assert batch_size > 0
+    return attend_in_chunks(
+        attend, q, gate, blocks, lengths, table, cache, batch_size=batch_size
+    )

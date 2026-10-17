@@ -46,7 +46,9 @@ def qsa_decode_attention(
         v_scale=v_scale,
     ):
         raise NotImplementedError(
-            "Fused decode requires TPU7x Q24/KV2/D256, ratio4, 512 groups, "
+            "Fused decode requires TPU7x, divisible Q/KV heads, "
+            "lane-aligned dimensions, "
+            "a ratio dividing the KV tile, a launch fitting SMEM/VMEM, "
             "BF16 query/gate, native BF16/FP8 cache, positive ratio-aligned "
             "pages and valid nonempty int32 metadata; use RPA otherwise."
         )

@@ -14,7 +14,7 @@
 
 """Decode-only orchestration around unchanged RPA compute and buffering.
 
-Each launch has at most 64 requests and fits in one SMEM schedule window.
+Each launch fits in one SMEM schedule window and the derived VMEM budget.
 There is no prefill, LSE output, cache update, or multi-window scheduling here.
 The decode specialization originated in tokamax/experiments/sparse_gqa_decode_v2.
 This adapter directly composes the current upstream RPA manual pipeline; its

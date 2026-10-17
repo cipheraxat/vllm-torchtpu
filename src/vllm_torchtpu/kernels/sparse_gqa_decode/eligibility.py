@@ -18,6 +18,9 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
+from .planning import query_batch_size
+from .tuned_block_sizes import DECODE_BLOCK
+
 
 def is_supported_by_fused_decode(
     q: jax.Array,
@@ -35,14 +38,19 @@ def is_supported_by_fused_decode(
     """Static eligibility; callers supply valid per-query selected groups."""
     if (
         q.ndim != 3
-        or q.shape[1:] != (24, 256)
+        or q.shape[1] <= 0
+        or q.shape[2] <= 0
+        or kv_heads <= 0
+        or q.shape[1] % kv_heads != 0
         or len(q) == 0
         or gate.shape != q.shape
         or q.dtype != jnp.bfloat16
         or gate.dtype != jnp.bfloat16
-        or kv_heads != 2
-        or ratio != 4
-        or blocks.shape != (len(q), 512)
+        or ratio <= 0
+        or DECODE_BLOCK.bkv_sz % ratio != 0
+        or blocks.ndim != 2
+        or blocks.shape[0] != len(q)
+        or blocks.shape[1] <= 0
         or lengths.shape != (len(q),)
         or table.ndim != 2
         or table.shape[0] != len(q)
@@ -61,16 +69,33 @@ def is_supported_by_fused_decode(
         or v_scale <= 0
     ):
         return False
+    info = pltpu.get_tpu_info()
+    if info.chip_version != pltpu.ChipVersion.TPU_7X:
+        return False
     packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
     # Physical token offsets, logical context lengths and flattened page-table
     # lookups use int32. These limits follow the indexing contract, not a
     # benchmark's largest batch or context.
     index_max = jnp.iinfo(jnp.int32).max
     if (
-        cache.shape[2:] != (4 // packing, packing, 256)
+        q.shape[2] % info.num_lanes != 0
+        or cache.shape[2:] != (math.ceil(2 * kv_heads / packing), packing, q.shape[2])
+        or (blocks.shape[1] + 1) * ratio > index_max
+        or len(q) * (blocks.shape[1] + 1) > index_max
         or table.shape[1] == 0
         or (table.shape[1] - 1) * cache.shape[1] >= index_max
         or table.size > index_max
     ):
         return False
-    return pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
+    return (
+        query_batch_size(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            kv_heads,
+            ratio,
+            blocks.shape[1],
+            cache.dtype,
+        )
+        > 0
+    )
