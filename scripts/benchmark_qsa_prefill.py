@@ -5,6 +5,8 @@ Run on an allocated TPU with the repository's pinned dependencies:
   PYTHONPATH=src python scripts/benchmark_qsa_prefill.py --output /tmp/qsa-prefill
 
 For BF16 paired-page A/B, add --cache-dtype bfloat16 --baseline kv128.
+For adaptive vs paired prefill, add --candidate adaptive --baseline paired.
+Adaptive requires page1664 and its documented single-request envelope.
 
 Includes selection metadata, attention and output gating; excludes the indexer,
 cache writes, compilation and warmup. Does not benchmark decode or a model.
@@ -227,7 +229,8 @@ def main() -> None:
         "--cache-dtype", choices=["float8_e4m3fn", "bfloat16"], default="float8_e4m3fn"
     )
     parser.add_argument("--page-size", type=int, choices=[128, 1664], default=1664)
-    parser.add_argument("--baseline", choices=["rpa", "kv128"], default="rpa")
+    parser.add_argument("--baseline", choices=["rpa", "kv128", "paired"], default="rpa")
+    parser.add_argument("--candidate", choices=["paired", "adaptive"], default="paired")
     args = parser.parse_args()
     assert args.iterations >= 3
     args.output.mkdir(parents=True, exist_ok=False)
@@ -248,7 +251,7 @@ def main() -> None:
                 kv_heads=2,
                 ratio=4,
                 query_block=256,
-                kv_tile=128,
+                kv_tile=256 if args.baseline == "paired" else 128,
             )
         ),
         "prefill": jax.jit(
@@ -261,6 +264,10 @@ def main() -> None:
             )
         ),
     }
+    if args.candidate == "adaptive":
+        from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import adaptive_prefill
+
+        functions["prefill"] = jax.jit(adaptive_prefill)
     for tokens in args.tokens:
         for context in args.contexts:
             for pattern in args.patterns:
@@ -319,6 +326,7 @@ def main() -> None:
                     page_size=args.page_size,
                     cache_dtype=args.cache_dtype,
                     baseline=args.baseline,
+                    candidate=args.candidate,
                     query_dtype="bfloat16",
                     relative_l2=relative_l2,
                     samples_ms=samples,
