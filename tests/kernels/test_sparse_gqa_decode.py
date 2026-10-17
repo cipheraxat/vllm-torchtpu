@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import rpa_attention
+from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention, rpa_attention
 from vllm_torchtpu.kernels.sparse_gqa_decode import (
     is_supported_by_fused_decode,
     qsa_decode_attention,
@@ -87,7 +87,9 @@ def test_qsa_decode_entry_matches_rpa_and_reference_without_cache_writes(
     reference, _ = jax.jit(functools.partial(rpa_attention, **opts))(*args)
     compiled = (
         jax.jit(
-            functools.partial(qsa_decode_attention, **opts),
+            functools.partial(
+                qsa_attention, starts=jnp.arange(batch + 1, dtype=jnp.int32), **opts
+            ),
             donate_argnums=(5,),
         )
         .lower(*args)
@@ -205,3 +207,37 @@ def test_decode_eligibility_keeps_unvalidated_shapes_on_rpa(monkeypatch, fp8, ca
     if case != "supported":
         with pytest.raises(NotImplementedError, match="measured TPU7x"):
             qsa_decode_attention(*args, kv_heads=2, k_scale=scale)
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
+    from vllm_torchtpu.kernels import sparse_gqa_decode
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
+
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    args = _specs()
+    if not supported:
+        args[0] = jax.ShapeDtypeStruct((8, 12, 256), jnp.bfloat16)
+        args[1] = args[0]
+    used = []
+
+    def fused(*inputs, **options):
+        used.append("fused")
+        return inputs[0], inputs[5]
+
+    def baseline(*inputs, **options):
+        used.append("rpa")
+        return inputs[0], inputs[5]
+
+    monkeypatch.setattr(sparse_gqa_decode, "qsa_decode_attention", fused)
+    monkeypatch.setattr(qsa_rpa, "rpa_attention", baseline)
+    out, cache = qsa_rpa.qsa_attention(
+        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
+    )
+    assert used == (["fused"] if supported else ["rpa"])
+    assert out is args[0]
+    assert cache is args[5]
