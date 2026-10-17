@@ -357,6 +357,22 @@ def _merge_chunked_lse_gathered(
     return torch.cat(pieces, dim=0)
 
 
+def weight_lse_partials(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """`merge_lse_partials_scatter_heads` without the reduce-scatter: this
+    rank's partial for every head, scaled by its share of the exact merge.
+    The caller sums the ranks (TPU_DCP_MLA_OPROJ_ALL_REDUCE: in o_proj's
+    all-reduce)."""
+    group = get_dcp_group()
+    assert group is not None
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    weight = torch.exp(lse - torch.logsumexp(lses, dim=0)).unsqueeze(-1)
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weighted = output.to(torch.float32) * weight
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    return weighted.to(output.dtype)
+
+
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     """Block `d` of `x`'s leading axis goes to rank `d`; block `r` of the
     result came from rank `r`."""

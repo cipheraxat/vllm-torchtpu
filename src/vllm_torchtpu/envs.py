@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS: int = 256
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 1024
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -540,6 +543,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # v_head_dim (256) instead of kv_lora_rank (512). Replicates W_UV per rank.
     "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
         "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
+    ),
+    # Under qrep, replicate o_proj over the DCP group too (and W_UV, as with
+    # TPU_DCP_MLA_UV_BEFORE_MERGE), so backbone steps of at least
+    # TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS tokens skip the merge's
+    # reduce-scatter: each rank runs o_proj on its weighted partial of every
+    # group head, and o_proj's all-reduce sums the ranks. Smaller steps keep
+    # the merge and the sharded o_proj. Needs a per-channel FP8 o_proj.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
+    ),
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS": env_int(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS", 256
+    ),
+    # Its o_proj and all-reduce run in chunks of this many tokens, pipelined
+    # (each chunk's all-reduce under the next chunk's o_proj). 0 = one chunk.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 1024
     ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins

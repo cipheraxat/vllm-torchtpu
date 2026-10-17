@@ -80,6 +80,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
     project_uv_heads,
+    weight_lse_partials,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
@@ -2713,13 +2714,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         layer.W_UV_dcp_qrep_scale,
                         out_dtype=wire_dtype if narrow else torch.float32,
                     )
-                outputs = merge_lse_partials_scatter_heads(
-                    partial,
-                    lse,
-                    is_backbone=is_backbone,
-                    wire_dtype=wire_dtype,
-                    query_start_loc=attn_metadata.query_start_loc,
-                )
+                if (
+                    uv_first
+                    and is_backbone
+                    and getattr(layer, "W_O_dcp_qrep", None) is not None
+                    and partial.shape[0] >= envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS
+                ):
+                    # Every group head, unsummed: the wrapper's o_proj
+                    # all-reduce sums the ranks (TPU_DCP_MLA_OPROJ_ALL_REDUCE).
+                    outputs = weight_lse_partials(partial, lse)
+                else:
+                    outputs = merge_lse_partials_scatter_heads(
+                        partial,
+                        lse,
+                        is_backbone=is_backbone,
+                        wire_dtype=wire_dtype,
+                        query_start_loc=attn_metadata.query_start_loc,
+                    )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2757,9 +2768,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         if uv_first:
-            outputs = outputs.to(input_dtype).reshape(
-                -1, layer.num_heads * layer.v_head_dim
-            )
+            outputs = outputs.to(input_dtype).flatten(1)
         else:
             outputs_t = outputs.reshape(
                 -1, layer.num_heads, layer.kv_lora_rank

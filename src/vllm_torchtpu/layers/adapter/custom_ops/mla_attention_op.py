@@ -22,6 +22,7 @@ import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -76,12 +77,15 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     _fp8_linear_pallas_jax,
+    quantized_matmul,
+    quantized_matmul_pallas,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -1248,6 +1252,16 @@ def _index_select_bits(t: torch.Tensor, axis: int, index: torch.Tensor):
     return fresh_buffer(out.view(t.dtype))
 
 
+def _plus_zero_of(x: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor:
+    """`x` plus a zero read from each of `tensors`, so a trace lifts them (or
+    orders after them). A dead read would be eliminated, so the zero rides on
+    `x`, as in `small_all_reduce_op.retain`."""
+    for t in tensors:
+        v = t[(0,) * t.ndim].to(x.dtype)
+        x = x + (v - v)
+    return x
+
+
 def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
     """Reorder a processed linear layer's output channels: `out'[j] = out[index[j]]`.
 
@@ -1532,6 +1546,8 @@ class VllmTPUMLAAttention(MLAAttention):
         self.W_UK_T_dcp_qrep_scale = None
         self.W_UV_dcp_qrep = None
         self.W_UV_dcp_qrep_scale = None
+        self.W_O_dcp_qrep = None
+        self.W_O_dcp_qrep_scale = None
         if self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
@@ -1547,7 +1563,7 @@ class VllmTPUMLAAttention(MLAAttention):
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
             # The group's W_UV too, so W_UV can run before the merge.
-            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
                 self.W_UV_dcp_qrep = fresh_buffer(
                     dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
                 )
@@ -1555,6 +1571,33 @@ class VllmTPUMLAAttention(MLAAttention):
                     self.W_UV_dcp_qrep_scale = fresh_buffer(
                         dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
                     )
+            # And its o_proj rows, so a large step can skip the reduce-scatter
+            # (TPU_DCP_MLA_OPROJ_ALL_REDUCE), as the FP8 loader gathered them
+            # from the checkpoint (DCP_ROWS_ATTR), followed by o_proj's own
+            # rows: both sides of the token-count branch slice the same buffers.
+            if envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
+                o = self.o_proj
+                if getattr(o, "weight_dcp", None) is None or o.weight_scale.ndim != 1:
+                    raise NotImplementedError(
+                        "TPU_DCP_MLA_OPROJ_ALL_REDUCE needs a per-channel FP8 "
+                        "o_proj from an FP8 checkpoint"
+                    )
+                w = torch.cat(
+                    [o.weight_dcp.view(torch.int8), o.weight.view(torch.int8)]
+                )
+                self.W_O_dcp_qrep = fresh_buffer(w.view(torch.float8_e4m3fn))
+                self.W_O_dcp_qrep_scale = fresh_buffer(
+                    torch.stack([o.weight_scale_dcp, o.weight_scale])
+                )
+                del o.weight_dcp, o.weight_scale_dcp
+                # o_proj keeps views of its rows there and frees its own copy;
+                # the forward reads only W_O_dcp_qrep.
+                rows = o.weight.shape[0]
+                for name, t in (
+                    ("weight", self.W_O_dcp_qrep[-rows:]),
+                    ("weight_scale", self.W_O_dcp_qrep_scale[1]),
+                ):
+                    o.register_parameter(name, Parameter(t, requires_grad=False))
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
@@ -1576,6 +1619,8 @@ class VllmTPUMLAAttention(MLAAttention):
                     self.W_UK_T_dcp_qrep_scale,
                     self.W_UV_dcp_qrep,
                     self.W_UV_dcp_qrep_scale,
+                    self.W_O_dcp_qrep,
+                    self.W_O_dcp_qrep_scale,
                 )
                 if t is not None
             )
@@ -1728,6 +1773,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        if envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE and self.mla_attn.dcp_q_replicate:
+            # The FP8 loader also gathers o_proj over the DCP group; the
+            # attention picks it up in process_weights_after_loading.
+            setattr(self.o_proj, DCP_ROWS_ATTR, True)
+            self.mla_attn.o_proj = self.o_proj
 
         self.prefix = prefix
 
@@ -2007,6 +2057,35 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             attn_out *= output_gate.sigmoid()
         elif self.g_proj is not None:
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+        w_o = getattr(self.mla_attn, "W_O_dcp_qrep", None)
+        if w_o is not None:
+            # TPU_DCP_MLA_OPROJ_ALL_REDUCE: W_O_dcp_qrep is the group's o_proj
+            # rows, then this rank's own (VllmTPUMLAAttention), so both sides of
+            # its token-count branch lift the same buffers, as the bucket warmup
+            # requires, and slice them at the same offsets on every rank.
+            s_o = self.mla_attn.W_O_dcp_qrep_scale
+            assert s_o is not None
+            local = self.num_heads * self.v_head_dim
+            if attn_out.shape[-1] == local:  # merged: this rank's own o_proj
+                pallas = getattr(self.o_proj, FP8_PALLAS_N_ATTR, None) is not None
+                mm = quantized_matmul_pallas if pallas else quantized_matmul
+                out = mm(attn_out, w_o[-local:], s_o[1])
+                return tensor_model_parallel_all_reduce(out)
+            # Every group head, unmerged: the group's o_proj, whose all-reduce
+            # also sums the DCP ranks. In token chunks, so a chunk's all-reduce
+            # overlaps the next chunk's o_proj; each all-reduce reads a zero
+            # from the one before, or XLA combines them after the last o_proj.
+            # The zero lands on one row: added to all of `y`, XLA fuses it into
+            # the dot, which would then wait for the previous all-reduce too.
+            w_o, s_o = w_o[:-local], s_o[0]
+            chunk = envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS
+            outs: list[torch.Tensor] = []
+            for x in attn_out.split(chunk or attn_out.shape[0]):
+                y = quantized_matmul(x, w_o, s_o)
+                if outs:
+                    y = y.slice_scatter(_plus_zero_of(y[:1], outs[-1]), 0, 0, 1)
+                outs.append(tensor_model_parallel_all_reduce(y))
+            return outs[0] if len(outs) == 1 else torch.cat(outs)
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]

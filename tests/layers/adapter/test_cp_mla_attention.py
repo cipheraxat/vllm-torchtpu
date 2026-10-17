@@ -340,6 +340,21 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
     np.testing.assert_array_equal(got[7], np.zeros_like(got[7]))
 
 
+@pytest.mark.parametrize("dcp_size", [2, 8])
+def test_unscattered_terms_sum_to_the_merge(dcp_size, monkeypatch):
+    """TPU_DCP_MLA_OPROJ_ALL_REDUCE: o_proj's all-reduce sums these terms."""
+    rng = np.random.default_rng(20261017)
+    outputs, lses = _partials(rng, dcp_size, empty=[(0, 1)])
+    outputs[0, 1] = float("nan")  # a zero-weight partial must not leak
+    total = torch.zeros(())
+    for rank in range(dcp_size):
+        group = _FakeGroup(outputs, lses, rank)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+        total = total + cp_mla.weight_lse_partials(outputs[rank], lses[rank])
+    want = _reference_merge(outputs.nan_to_num(0.0), lses)
+    np.testing.assert_allclose(total.numpy(), want, rtol=1e-5, atol=1e-5)
+
+
 class _HeadGatherGroup:
     """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
 
