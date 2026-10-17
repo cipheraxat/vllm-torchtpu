@@ -1562,26 +1562,21 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
-            # The group's W_UV too, so W_UV can run before the merge.
-            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
-                self.W_UV_dcp_qrep = fresh_buffer(
-                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
-                )
-                if hasattr(self, "W_UV_scale"):
-                    self.W_UV_dcp_qrep_scale = fresh_buffer(
-                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
-                    )
-            # And its o_proj rows, so a large step can skip the reduce-scatter
+            # The group's o_proj rows, so a large step can skip the reduce-scatter
             # (TPU_DCP_MLA_OPROJ_ALL_REDUCE), as the FP8 loader gathered them
             # from the checkpoint (DCP_ROWS_ATTR), followed by o_proj's own
             # rows: both sides of the token-count branch slice the same buffers.
-            if envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
-                o = self.o_proj
-                if getattr(o, "weight_dcp", None) is None or o.weight_scale.ndim != 1:
-                    raise NotImplementedError(
-                        "TPU_DCP_MLA_OPROJ_ALL_REDUCE needs a per-channel FP8 "
-                        "o_proj from an FP8 checkpoint"
-                    )
+            # Without them (o_proj not per-channel FP8 from an FP8 checkpoint)
+            # every step keeps the reduce-scatter.
+            o = getattr(self, "o_proj", None)
+            if o is not None and (
+                getattr(o, "weight_dcp", None) is None or o.weight_scale.ndim != 1
+            ):
+                logger.warning_once(
+                    "TPU_DCP_MLA_OPROJ_ALL_REDUCE needs a per-channel FP8 o_proj "
+                    "from an FP8 checkpoint; keeping the reduce-scatter."
+                )
+            elif o is not None:
                 w = torch.cat(
                     [o.weight_dcp.view(torch.int8), o.weight.view(torch.int8)]
                 )
@@ -1598,6 +1593,15 @@ class VllmTPUMLAAttention(MLAAttention):
                     ("weight_scale", self.W_O_dcp_qrep_scale[1]),
                 ):
                     o.register_parameter(name, Parameter(t, requires_grad=False))
+            # The group's W_UV too, so W_UV can run before the merge.
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or self.W_O_dcp_qrep is not None:
+                self.W_UV_dcp_qrep = fresh_buffer(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                )
+                if hasattr(self, "W_UV_scale"):
+                    self.W_UV_dcp_qrep_scale = fresh_buffer(
+                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                    )
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
-    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = True
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS: int = 256
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 1024
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
@@ -549,9 +549,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS tokens skip the merge's
     # reduce-scatter: each rank runs o_proj on its weighted partial of every
     # group head, and o_proj's all-reduce sums the ranks. Smaller steps keep
-    # the merge and the sharded o_proj. Needs a per-channel FP8 o_proj.
+    # the merge and the sharded o_proj. On by default; a no-op unless o_proj is
+    # per-channel FP8 from an FP8 checkpoint. Costs one o_proj per layer of HBM.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
-        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=True
     ),
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS", 256
