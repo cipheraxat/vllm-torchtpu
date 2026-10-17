@@ -7,13 +7,18 @@ batched RPA for other decode configurations. The prefill branch is unchanged.
 
 - TPU7x; BF16 queries and gates; 24 query heads, 2 KV heads, head dimension 256.
 - Compression ratio 4 and 512 selected complete groups, plus the partial tail.
-- Native `HEAD_ALONG_SUBLANE` BF16 or FP8 E4M3FN cache, page size 128 or 1664.
-- Batch 1–256, page tables covering at most 256K tokens per request.
+- Native `HEAD_ALONG_SUBLANE` BF16 or FP8 E4M3FN cache with a positive page
+  size divisible by the compression ratio.
+- Nonempty batches and page tables; physical token offsets, logical context
+  lengths and flattened page-table indices must fit int32.
 - Positive finite scalar K/V scales and the existing valid-prefix selection
   contract. Cache already contains the current decode token.
 
 `is_supported_by_fused_decode` owns this envelope. The direct entry rejects
 unsupported inputs; the QSA dispatcher retains the existing RPA fallback.
+Batch size and context length are not capped at the benchmark maxima. Attention
+launches are bounded by chunking; page-table lookup and tensor allocations still
+consume resources in proportion to their shapes.
 
 ## Implementation and ownership
 
@@ -45,7 +50,8 @@ pytest tests/kernels/test_sparse_gqa_decode.py tests/kernels/test_qwen4_exp_qsa_
 
 The tests cover dispatch and fallback, both cache dtypes, a float64 oracle,
 non-unit FP8 scales, partial groups, empty requests, poisoned inactive storage,
-the B65 chunk boundary, cache bytes, and prefill-to-decode state transitions.
+the B65/257/513 chunk boundaries, page sizes 4/128/132/256/1664, contexts
+through 524289 tokens, cache bytes, and prefill-to-decode state transitions.
 The new hardware tests carry the `tpu_test` marker for the TPU CI queue.
 
 ## Performance
@@ -86,12 +92,33 @@ in every case. The largest measured relative L2 difference against RPA is
 1.53e-8. These measurements sample the supported envelope, not every possible
 batch/context combination.
 
+Additional measurements beyond the original benchmark range, with the same
+hardware, versions, timing boundary and 50-sample protocol:
+
+| Batch | Context | Page size | BF16 speedup | FP8 speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 2051 | 4 | 1.076× | 1.088× |
+| 8 | 8193 | 132 | 1.089× | 1.094× |
+| 64 | 8193 | 132 | 1.352× | 1.370× |
+| 257 | 8193 | 256 | 1.475× | 1.511× |
+| 512 | 8193 | 256 | 1.549× | 1.595× |
+| 1 | 524289 | 256 | 1.141× | 1.140× |
+| 4 | 524289 | 256 | 1.106× | 1.104× |
+
+All 14 additional cases improve, with paired bootstrap 95% lower bounds above 1.
+These are measured configurations, not dispatch limits or a guarantee of a
+speedup at every larger shape. The numerical kernels and query chunking are
+unchanged; eligibility now follows page alignment and int32 indexing contracts.
+
 XProf captures three completed calls per arm. At BF16 B64/context8192,
 device-active time (union of XLA-op intervals) falls from 459.7 to 284.2 µs,
 and operations per call from 113 to 75. The principal attention kernel itself
 rises from 202.0 to 227.5 µs: the overall gain comes from reducing surrounding
 work, not a faster QK/softmax/PV implementation. At FP8 B64, device-active time
 falls from 457.3 to 274.0 µs and operations from 115 to 75.
+At B512/context8193/page256, the additional traces show device-active time
+falling from 3687.8 to 2302.6 µs for BF16 and 3669.7 to 2218.5 µs for FP8;
+operations per call fall from 942 to 732 for both.
 
 Compiled temporary allocation at BF16 B64 falls from 17,021,952 to 3,517,536
 bytes; cache alias bytes remain 1,090,519,040 for both. This is executable memory
@@ -116,6 +143,27 @@ done
 Each output directory contains timing samples, numerical errors, executable
 memory statistics, compiled HLO and, with `--trace`, XProf traces. Each request
 owns separate native cache pages; context includes the current decode token.
+Reproduce the additional configurations:
+
+```bash
+for dtype in bf16 fp8; do
+  args=()
+  if [ "$dtype" = fp8 ]; then args+=(--fp8); fi
+  python scripts/benchmark_sparse_gqa_decode.py "${args[@]}" \
+    --batches 257 512 --contexts 8193 --page-size 256 \
+    --trace --output "results/$dtype-large-batch"
+  python scripts/benchmark_sparse_gqa_decode.py "${args[@]}" \
+    --batches 1 4 --contexts 524289 --page-size 256 \
+    --output "results/$dtype-wide-table"
+  python scripts/benchmark_sparse_gqa_decode.py "${args[@]}" \
+    --batches 8 64 --contexts 8193 --page-size 132 \
+    --output "results/$dtype-page132"
+  python scripts/benchmark_sparse_gqa_decode.py "${args[@]}" \
+    --batches 8 --contexts 2051 --page-size 4 \
+    --output "results/$dtype-page4"
+done
+```
+
 The tested source base is #1964 at `16d79f36b327f304952852198f4c0c765af01ef6`.
 
 These measurements exclude index selection, KV updates, RoPE, projections and

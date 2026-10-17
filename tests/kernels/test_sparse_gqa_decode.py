@@ -73,6 +73,10 @@ def _case(batch, context, page, fp8):
         (3, 2051, 1664),
         (65, 2051, 1664),
         (3, 0, 1664),
+        (257, 2051, 256),
+        (513, 7, 4),
+        (3, 2051, 132),
+        (1, 524289, 256),
     ],
 )
 def test_qsa_decode_entry_matches_rpa_and_reference_without_cache_writes(
@@ -182,7 +186,7 @@ def _specs(fp8=False):
         "hardware",
     ],
 )
-def test_decode_eligibility_keeps_unvalidated_shapes_on_rpa(monkeypatch, fp8, case):
+def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
     chip = pltpu.ChipVersion.TPU_V5P if case == "hardware" else pltpu.ChipVersion.TPU_7X
     monkeypatch.setattr(
         pltpu, "get_tpu_info", lambda: pltpu.get_tpu_info_for_chip(chip, 1)
@@ -190,10 +194,10 @@ def test_decode_eligibility_keeps_unvalidated_shapes_on_rpa(monkeypatch, fp8, ca
     args = _specs(fp8)
     changes = {
         "heads": (0, (8, 12, 256)),
-        "page": (5, (158, 256, *args[5].shape[2:])),
+        "page": (5, (158, 130, *args[5].shape[2:])),
         "budget": (2, (8, 256)),
         "batch": (0, (257, 24, 256)),
-        "table": (4, (8, 159)),
+        "table": (4, (8, 0)),
     }
     if case in changes:
         i, shape = changes[case]
@@ -205,7 +209,7 @@ def test_decode_eligibility_keeps_unvalidated_shapes_on_rpa(monkeypatch, fp8, ca
         *args, kv_heads=2, ratio=4, k_scale=scale, v_scale=1.0
     ) == (case == "supported")
     if case != "supported":
-        with pytest.raises(NotImplementedError, match="measured TPU7x"):
+        with pytest.raises(NotImplementedError, match="requires TPU7x"):
             qsa_decode_attention(*args, kv_heads=2, k_scale=scale)
 
 
@@ -241,3 +245,66 @@ def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
     assert used == (["fused"] if supported else ["rpa"])
     assert out is args[0]
     assert cache is args[5]
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize(
+    "batch,page,columns",
+    [(257, 256, 2049), (1025, 4, 131073), (3, 132, 4096)],
+)
+def test_decode_eligibility_uses_geometry_not_benchmark_limits(
+    monkeypatch, fp8, batch, page, columns
+):
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    args = _specs(fp8)
+    shapes = [
+        (batch, 24, 256),
+        (batch, 24, 256),
+        (batch, 512),
+        (batch,),
+        (batch, columns),
+        (1, page, *args[5].shape[2:]),
+    ]
+    args = [jax.ShapeDtypeStruct(shape, arg.dtype) for shape, arg in zip(shapes, args)]
+    assert is_supported_by_fused_decode(
+        *args, kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty_batch",
+        "empty_page",
+        "physical_overflow",
+        "logical_overflow",
+        "table_overflow",
+    ],
+)
+def test_decode_eligibility_rejects_empty_or_overflowing_metadata(monkeypatch, case):
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    args = _specs()
+    if case == "empty_batch":
+        for i in range(5):
+            args[i] = jax.ShapeDtypeStruct((0, *args[i].shape[1:]), args[i].dtype)
+    else:
+        i, shape = {
+            "empty_page": (5, (1, 0, 2, 2, 256)),
+            "physical_overflow": (5, (2**24, 128, 2, 2, 256)),
+            "logical_overflow": (4, (8, 2**31 // 1664 + 2)),
+            "table_overflow": (4, (8, 2**28)),
+        }[case]
+        args[i] = jax.ShapeDtypeStruct(shape, args[i].dtype)
+        if case == "table_overflow":
+            args[5] = jax.ShapeDtypeStruct((1, 4, 2, 2, 256), args[5].dtype)
+    assert not is_supported_by_fused_decode(
+        *args, kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0
+    )

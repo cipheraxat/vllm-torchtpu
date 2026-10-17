@@ -46,8 +46,9 @@ def qsa_decode_attention(
         v_scale=v_scale,
     ):
         raise NotImplementedError(
-            "Fused decode requires the measured TPU7x Q24/KV2/D256, ratio4, "
-            "512 groups, page128/1664, batch1-256 envelope; use RPA otherwise."
+            "Fused decode requires TPU7x Q24/KV2/D256, ratio4, 512 groups, "
+            "BF16 query/gate, native BF16/FP8 cache, positive ratio-aligned "
+            "pages and valid nonempty int32 metadata; use RPA otherwise."
         )
     return _decode(
         q,

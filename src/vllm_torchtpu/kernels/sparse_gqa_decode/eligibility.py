@@ -16,7 +16,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
@@ -37,7 +36,7 @@ def is_supported_by_fused_decode(
     if (
         q.ndim != 3
         or q.shape[1:] != (24, 256)
-        or not 1 <= len(q) <= 256
+        or len(q) == 0
         or gate.shape != q.shape
         or q.dtype != jnp.bfloat16
         or gate.dtype != jnp.bfloat16
@@ -49,7 +48,8 @@ def is_supported_by_fused_decode(
         or table.shape[0] != len(q)
         or cache.ndim != 5
         or cache.shape[0] <= 0
-        or cache.shape[1] not in (128, 1664)
+        or cache.shape[1] <= 0
+        or cache.shape[1] % ratio != 0
         or cache.shape[0] * cache.shape[1] > jnp.iinfo(jnp.int32).max
         or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
         or any(x.dtype != jnp.int32 for x in (blocks, lengths, table))
@@ -62,8 +62,15 @@ def is_supported_by_fused_decode(
     ):
         return False
     packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
-    if cache.shape[2:] != (4 // packing, packing, 256) or not 1 <= table.shape[
-        1
-    ] <= pl.cdiv(262144, cache.shape[1]):
+    # Physical token offsets, logical context lengths and flattened page-table
+    # lookups use int32. These limits follow the indexing contract, not a
+    # benchmark's largest batch or context.
+    index_max = jnp.iinfo(jnp.int32).max
+    if (
+        cache.shape[2:] != (4 // packing, packing, 256)
+        or table.shape[1] == 0
+        or (table.shape[1] - 1) * cache.shape[1] >= index_max
+        or table.size > index_max
+    ):
         return False
     return pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
