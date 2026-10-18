@@ -2467,10 +2467,8 @@ class Eagle3Proposer:
         max_loop_bucket = _get_padded_token_len(
             runner.num_tokens_paddings, runner.max_num_reqs
         )
-        idx_sizes = sorted(
-            set(runner.num_reqs_paddings)
-            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
-        )
+        # p is always `_loop_bucket(num_reqs)`, a token padding.
+        idx_sizes = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
         hidden_size = self._draft_hidden_size()
         with runner._precompile_timed("drafter two-pass gather_rows"):
             for num_tokens in runner.num_tokens_paddings:

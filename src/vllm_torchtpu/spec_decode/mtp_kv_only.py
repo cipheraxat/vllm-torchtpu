@@ -89,8 +89,13 @@ def kv_only_unsupported_reason(mtp: nn.Module | None) -> str | None:
     wrapper = getattr(getattr(block, "self_attn", None), "mla_attn", None)
     if not isinstance(wrapper, VllmTPUMultiHeadLatentAttentionWrapper):
         return "the MTP attention is not the TPU MLA wrapper"
-    if not wrapper.is_sparse or not isinstance(wrapper.indexer, VllmTPUIndexer):
-        return "the MTP attention is not sparse (DSA) MLA with an indexer"
+    if not wrapper.is_sparse:
+        return "the MTP attention is not sparse (DSA) MLA"
+    if not isinstance(wrapper.indexer, VllmTPUIndexer):
+        return (
+            "the MTP attention has no indexer of its own "
+            f"({type(wrapper.indexer).__name__}); pass 1 must write its K cache"
+        )
     if wrapper.kimi_preprocess is not None:
         return "the Kimi fused MLA preprocess is not mirrored"
     if getattr(wrapper.indexer, "indexer_op", None) is None:
