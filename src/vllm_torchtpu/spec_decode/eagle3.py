@@ -230,6 +230,11 @@ class Eagle3Proposer:
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._vocab_parallel_argmax = None
         self._mtp_fused_loop_warm = False
+        # TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: pass 1 of a two-pass draft step 0
+        # (see mtp_kv_only.py), a compiled program that only writes the MTP
+        # layer's KV and indexer-K caches. Built in load_model; None keeps the
+        # single full step-0 pass.
+        self._mtp_kv_only_model: torch.nn.Module | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -338,6 +343,7 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+        self._build_mtp_kv_only_model()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -663,6 +669,204 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
 
+    def _build_mtp_kv_only_model(self) -> None:
+        """Build pass 1 of the two-pass draft step 0, when asked for.
+
+        `TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS` > 0 splits a large step 0 into a
+        KV-only pass over every row (`MtpKvOnlyModel`) and the full layer on
+        one row per request (see `_two_pass_step0`). Only a single-layer DSA
+        MTP draft that owns its KV cache qualifies; PCP localizes the gather
+        indices per rank, which pass 2's row selection does not model. A draft
+        that does not qualify, or a program that cannot be built, keeps the
+        single full pass.
+        """
+        self._mtp_kv_only_model = None
+        if envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS <= 0:
+            return
+        reason = None
+        if self.speculative_config.method != "mtp":
+            reason = f"the draft method is {self.speculative_config.method!r}"
+        elif self._draft_kv_shared:
+            reason = "the draft reads the target's KV cache"
+        elif self.runner._pcp_enabled:
+            reason = "prefill context parallelism is on"
+        else:
+            from vllm_torchtpu.spec_decode.mtp_kv_only import (
+                kv_only_unsupported_reason,
+            )
+
+            reason = kv_only_unsupported_reason(self.draft_model)
+        if reason is None:
+            try:
+                from vllm_torchtpu.spec_decode.mtp_kv_only import MtpKvOnlyModel
+
+                with (
+                    set_model_tag("eagle_head"),
+                    set_vllm_model_wrapper_context(
+                        mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                    ),
+                    set_current_vllm_config(self.draft_vllm_config),
+                ):
+                    self._mtp_kv_only_model = MtpKvOnlyModel(
+                        vllm_config=self.draft_vllm_config,
+                        prefix="mtp_prefill_kv_only",
+                        mtp=self.draft_model,
+                        mesh=self.runner.mesh,
+                    )
+            except Exception as e:
+                logger.warning("Could not build the MTP KV-only pass.", exc_info=True)
+                reason = f"build failed ({type(e).__name__})"
+        if reason is not None:
+            logger.warning(
+                "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is set, but %s; draft "
+                "step 0 keeps the single full pass.",
+                envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS,
+                reason,
+            )
+            return
+        logger.info(
+            "MTP draft step 0 of chunks with >= %d tokens runs a KV-only pass "
+            "over every row, then the full layer on one row per request.",
+            envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS,
+        )
+
+    def _use_kv_only_two_pass(
+        self, chunk: DraftChunkInputs, num_tokens: int, num_rows: int
+    ) -> bool:
+        """Whether this chunk's step 0 takes the two-pass path.
+
+        `num_tokens` is the chunk's padded step-0 token count and `num_rows`
+        the per-request row bucket p. Host-side only, so every rank of a TP
+        group, which sees the same scheduler output, decides the same way.
+        """
+        if self._mtp_kv_only_model is None:
+            return False
+        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
+        if min_tokens <= 0 or num_tokens < min_tokens or num_tokens <= num_rows:
+            return False
+        # EP-DP lockstep replays a peer's draft trace on idle ranks
+        # (run_dp_dummy_draft), which only knows the single pass.
+        if self._dp_lockstep_sharded():
+            return False
+        # Pass 2 derives its metadata from the target's own step-0 entries;
+        # None for dummy chunks and chunks without them.
+        return self._target_draft_attn_metadata(chunk) is not None
+
+    def _pass2_attn_metadata(
+        self,
+        chunk: DraftChunkInputs,
+        target_md: dict[str, AttentionMetadata],
+        num_rejected: np.ndarray | torch.Tensor,
+    ) -> dict[str, AttentionMetadata]:
+        """Step-0 metadata narrowed to one query per request.
+
+        Request r's query is the end of its accepted prefix, at position
+        `seq_lens[r] - num_rejected[r] - 1`, so its seq_len is
+        `seq_lens[r] - num_rejected[r]`: the causal window that row has in the
+        full pass, rejected verify tail excluded. Query start locations and
+        the request distribution are the loop steps' (one query per request,
+        all decode); block tables are unchanged.
+        """
+        runner = self.runner
+        num_reqs = chunk.num_reqs
+        kernel_num_reqs = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert kernel_num_reqs is not None
+        if isinstance(num_rejected, torch.Tensor):
+            rejected = _maybe_pad_dim0(num_rejected, kernel_num_reqs)
+        else:
+            padded_np = np.zeros(kernel_num_reqs, dtype=np.int32)
+            padded_np[:num_reqs] = num_rejected
+            rejected = torch.from_numpy(padded_np).to(runner.device)
+        seq_lens = chunk.attn_ctx.seq_lens - rejected
+        qsl_np = np.minimum(np.arange(kernel_num_reqs + 1, dtype=np.int32), num_reqs)
+        query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
+        request_distribution = torch.tensor(
+            [num_reqs] * 3, dtype=torch.int32, device=runner.device
+        )
+        replaced: dict[int, AttentionMetadata] = {}
+        result = {}
+        for name, md in target_md.items():
+            if id(md) not in replaced:
+                replaced[id(md)] = dataclasses.replace(
+                    md,
+                    # pyrefly: ignore[bad-argument-type]
+                    seq_lens=seq_lens,
+                    # pyrefly: ignore[bad-argument-type]
+                    query_start_loc=query_start_loc,
+                    # pyrefly: ignore[bad-argument-type]
+                    request_distribution=request_distribution,
+                )
+            result[name] = replaced[id(md)]
+        return result
+
+    def _two_pass_step0(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        gather_indices: torch.Tensor,
+        num_rejected: np.ndarray | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Draft step 0 of one chunk as KV-only pass + per-request full pass.
+
+        Returns the `[p]` carries `(last_hidden, hidden, positions)` the
+        single pass would gather at `gather_indices`.
+
+        Pass 1 writes the MTP KV and indexer-K entries of every row with the
+        target's step-0 metadata, through the writers the full pass uses.
+        Pass 2 runs the draft's own step-0 program (indexer on) on the rows at
+        `gather_indices` with `_pass2_attn_metadata`; each of those rows
+        attends to exactly the cache window it has in the single pass, which
+        pass 1 has just filled, and rewrites its own entries with the same
+        values. The other rows' outputs are never read, so they are not
+        computed.
+        """
+        assert self._mtp_kv_only_model is not None
+        runner = self.runner
+        target_md = self._target_draft_attn_metadata(chunk)
+        assert target_md is not None
+        num_tokens = input_ids.shape[0]
+        with (
+            set_model_tag("eagle_head"),
+            set_forward_context(
+                target_md,
+                self.draft_vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=runner.mesh, vllm_config=self.draft_vllm_config
+            ),
+        ):
+            self._mtp_kv_only_model(input_ids, positions, target_hidden_states)
+
+        # Pass 2's inputs through the carry-gather program, at the shapes and
+        # dtypes the single pass gathers its carries with (token ids are int32
+        # like positions), so this compiles nothing new.
+        rows_hidden, rows_ids, _ = self._draft_gather_carries(
+            target_hidden_states, input_ids, target_hidden_states, gather_indices
+        )
+        _, rows_positions, _ = self._draft_gather_carries(
+            target_hidden_states, positions, target_hidden_states, gather_indices
+        )
+        last_hidden, hidden = self._forward_draft(
+            chunk=chunk,
+            input_ids=rows_ids,
+            positions=rows_positions,
+            target_hidden_states=rows_hidden,
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=None,
+            num_tokens_padded=gather_indices.shape[0],
+            attn_metadata=self._pass2_attn_metadata(chunk, target_md, num_rejected),
+        )
+        return last_hidden, hidden, rows_positions
+
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
 
@@ -698,6 +902,12 @@ class Eagle3Proposer:
         assert self.draft_model is not None
         self.draft_model.model.compact_topk_indices(gather_indices)
         num_rows = gather_indices.shape[0]
+        return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
+
+    def _mtp_save_topk(self, num_rows: int) -> list[torch.Tensor]:
+        """Snapshot step 0's top-k rows when they are already one per request
+        (the two-pass step 0's pass 2): `_mtp_compact_and_save` without the
+        compaction."""
         return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
 
     def _mtp_restore_topk(self, saved: list[torch.Tensor]) -> None:
@@ -1199,6 +1409,39 @@ class Eagle3Proposer:
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
             )
+            if self._use_kv_only_two_pass(
+                chunk, input_ids.shape[0], last_token_indices.shape[0]
+            ):
+                # TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: KV-only pass over every
+                # row, then the full layer on the per-request rows only; its
+                # outputs are already the [p] carries.
+                owner_mask = last_token_indices.ge(0)
+                safe_gather_indices = last_token_indices.clamp_min(0)
+                last_hidden_carry, hidden_carry, positions_carry = self._two_pass_step0(
+                    chunk=chunk,
+                    input_ids=input_ids,
+                    positions=positions,
+                    target_hidden_states=target_hidden_states,
+                    gather_indices=safe_gather_indices,
+                    num_rejected=num_rejected,
+                )
+                if self._share_mtp_indices:
+                    # Pass 2 wrote one top-k row per request, in order.
+                    saved_topk_per_chunk.append(
+                        self._mtp_save_topk(safe_gather_indices.shape[0])
+                    )
+                last_hidden_carry = (
+                    chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
+                        last_hidden_carry, owner_mask
+                    )
+                )
+                hidden_carry_per_chunk.append(hidden_carry)
+                positions_carry_per_chunk.append(positions_carry)
+                with set_model_tag("eagle_head"):
+                    draft_tokens_per_chunk.append(
+                        [self._draft_propose_token(last_hidden_carry)]
+                    )
+                continue
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
@@ -1937,17 +2180,19 @@ class Eagle3Proposer:
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
+        attn_metadata: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        attn_metadata = self._build_draft_attn_metadata(
-            chunk=chunk,
-            step_idx=step_idx,
-            seq_lens_delta=seq_lens_delta,
-            num_rejected_np=num_rejected_np,
-            num_tokens_padded=num_tokens_padded,
-            num_rejected_dev=num_rejected_dev,
-            loop_query_start_loc=loop_query_start_loc,
-            loop_request_distribution=loop_request_distribution,
-        )
+        if attn_metadata is None:
+            attn_metadata = self._build_draft_attn_metadata(
+                chunk=chunk,
+                step_idx=step_idx,
+                seq_lens_delta=seq_lens_delta,
+                num_rejected_np=num_rejected_np,
+                num_tokens_padded=num_tokens_padded,
+                num_rejected_dev=num_rejected_dev,
+                loop_query_start_loc=loop_query_start_loc,
+                loop_request_distribution=loop_request_distribution,
+            )
 
         num_tokens = input_ids.shape[0]
 
