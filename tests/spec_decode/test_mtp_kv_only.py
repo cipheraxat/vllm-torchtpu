@@ -9,6 +9,7 @@ only through a causal read of caches every row writes first.
 """
 
 import contextlib
+import dataclasses
 from types import SimpleNamespace
 from unittest import mock
 
@@ -86,6 +87,7 @@ def _build_proposer(monkeypatch, *, min_tokens=1024, method="mtp"):
     proposer.draft_model = object()
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(_pcp_enabled=False, mesh=object())
+    proposer._draft_attn_layer_names = {"mtp.attn", "mtp.indexer.k_cache"}
     return proposer
 
 
@@ -99,6 +101,9 @@ def _patch_builder(monkeypatch, reason=None, raises=False):
             if raises:
                 raise RuntimeError("boom")
             built.append(kwargs)
+
+        def cache_layer_names(self):
+            return ("mtp.attn", "mtp.indexer.k_cache")
 
     monkeypatch.setattr(kv_only, "kv_only_unsupported_reason", lambda mtp: reason)
     monkeypatch.setattr(kv_only, "MtpKvOnlyModel", _FakeModel)
@@ -132,7 +137,7 @@ def test_build_kv_only_model_builds_with_draft_config_and_own_prefix(monkeypatch
 
 @pytest.mark.parametrize(
     "setup",
-    ["eagle3", "kv_shared", "pcp", "unsupported", "build_fails"],
+    ["eagle3", "kv_shared", "pcp", "unsupported", "build_fails", "not_draft_layers"],
 )
 def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
     proposer = _build_proposer(
@@ -147,9 +152,14 @@ def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
         proposer._draft_kv_shared = True
     if setup == "pcp":
         proposer.runner._pcp_enabled = True
+    if setup == "not_draft_layers":
+        # The indexer cache is not among the draft's attention layers, so the
+        # step-0 metadata pass 1 reads would not carry it.
+        proposer._draft_attn_layer_names = {"mtp.attn"}
     proposer._build_mtp_kv_only_model()
     assert proposer._mtp_kv_only_model is None
-    assert built == []
+    if setup != "not_draft_layers":
+        assert built == []
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +204,8 @@ def test_pass2_attn_metadata_is_one_query_per_request(async_rejected):
     if async_rejected:
         rejected = torch.from_numpy(rejected)
 
-    out = proposer._pass2_attn_metadata(chunk, target_md, rejected)
+    loop_inputs = proposer._chunk_loop_inputs(chunk, rejected)
+    out = proposer._pass2_attn_metadata(chunk, target_md, rejected, loop_inputs)
 
     assert out["a"] is out["b"]  # shared metadata stays shared
     new = out["a"]
@@ -202,6 +213,9 @@ def test_pass2_attn_metadata_is_one_query_per_request(async_rejected):
     assert new.seq_lens.tolist() == [8, 6, 8, 0, 0, 0]
     assert new.query_start_loc.tolist() == [0, 1, 2, 3, 3, 3, 3]
     assert new.request_distribution.tolist() == [3, 3, 3]
+    # The loop steps reuse the same query starts and distribution.
+    assert new.query_start_loc is loop_inputs[1]
+    assert new.request_distribution is loop_inputs[2]
     # The target's own metadata is untouched.
     assert md.seq_lens is chunk.attn_ctx.seq_lens
     assert md.query_start_loc is chunk.attn_ctx.query_start_loc
@@ -246,6 +260,9 @@ class _ToyWorld:
         qsl = md.query_start_loc.tolist()
         seq_lens = md.seq_lens.tolist()
         num_reqs = int(md.request_distribution[2])
+        # The toy's "block table": entry r * PAGES_PER_REQ is request r's
+        # batch-wide id, i.e. which cache rows it owns.
+        owners = md.block_tables.tolist()
         out = []
         for t in range(num_tokens):
             r = next((r for r in range(num_reqs) if qsl[r] <= t < qsl[r + 1]), None)
@@ -254,7 +271,7 @@ class _ToyWorld:
             pos = seq_lens[r] - (qsl[r + 1] - qsl[r]) + (t - qsl[r])
             # The metadata and the row's own position agree.
             assert pos == int(positions[t]), (t, r, pos, int(positions[t]))
-            out.append((t, r, pos))
+            out.append((t, owners[r * PAGES_PER_REQ], pos))
         return out
 
     def write(self, input_ids, positions, hidden):
@@ -346,35 +363,63 @@ class _Req:
         return self.tokens[i]
 
 
-# Three requests in one chunk, K = 3:
+PAGES_PER_REQ = 4
+KNR = 4
+GATE = 9
+
+
+@dataclasses.dataclass
+class _ReqSpec:
+    rid: str
+    context: int
+    q_len: int
+    rejected: int = 0
+    # Sync: the sampled tokens; async: the rejection-sampler row.
+    sampled: tuple = ()
+    async_row: tuple = (0, -1, -1, -1)
+    num_drafts: int = 0
+    discard: bool = False
+
+
+# Chunk 0 (16 padded tokens, at the gate or above -> two-pass), K = 3:
 #   r0 verify: context 6, 1 + K = 4 tokens (positions 6..9), 2 drafts rejected;
 #   r1 prefill whose prompt completes: 6 tokens (positions 0..5);
 #   r2 intermediate prefill chunk: 5 tokens (positions 3..7), discarded.
-_Q_LENS = [4, 6, 5]
-_CONTEXT = [6, 0, 3]
-_REJECTED = [2, 0, 0]
+_CHUNK0 = [
+    _ReqSpec("r0", 6, 4, 2, (11, 12), (11, 12, -1, -1), 3),
+    _ReqSpec("r1", 0, 6, 0, (13,), (13, -1, -1, -1)),
+    _ReqSpec("r2", 3, 5, discard=True),
+]
+# Chunk 1 (8 tokens, below the gate -> single pass): two verify requests.
+_CHUNK1 = [
+    _ReqSpec("r3", 4, 4, 1, (21, 22, 23), (21, 22, 23, -1), 3),
+    _ReqSpec("r4", 2, 4, 0, (31, 32, 33, 34), (31, 32, 33, 34), 3),
+]
 
 
-def _scenario(mode: str):
-    num_reqs = 3
-    knr = 4
-    T_real = sum(_Q_LENS)
-    T = 16
-    qsl = np.concatenate([[0], np.cumsum(_Q_LENS)]).astype(np.int32)
-    seq_lens = [c + q for c, q in zip(_CONTEXT, _Q_LENS)]
-    positions = np.zeros(T, dtype=np.int32)
-    for r in range(num_reqs):
-        positions[qsl[r] : qsl[r + 1]] = np.arange(_CONTEXT[r], seq_lens[r])
-    input_ids = np.zeros(T, dtype=np.int32)
-    input_ids[:T_real] = np.arange(T_real) % 7 + 3
-    g = torch.Generator().manual_seed(2)
-    hidden = torch.randn(T, HIDDEN, generator=g)
+def _chunk(specs, start, padded):
+    num_reqs = len(specs)
+    q_lens = [sp.q_len for sp in specs]
+    qsl = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    seq_lens = [sp.context + sp.q_len for sp in specs]
+    positions = np.zeros(padded, dtype=np.int32)
+    for r, sp in enumerate(specs):
+        positions[qsl[r] : qsl[r + 1]] = np.arange(sp.context, seq_lens[r])
+    real = int(qsl[-1])
+    input_ids = np.zeros(padded, dtype=np.int32)
+    input_ids[:real] = (np.arange(real) + 5 * start) % 7 + 3
+    g = torch.Generator().manual_seed(2 + start)
+    hidden = torch.randn(padded, HIDDEN, generator=g)
+    owners = np.zeros(KNR * PAGES_PER_REQ, dtype=np.int32)
+    owners[: num_reqs * PAGES_PER_REQ : PAGES_PER_REQ] = np.arange(
+        start, start + num_reqs
+    )
     md = AttentionMetadata(
         input_positions=torch.from_numpy(positions),
-        block_tables=torch.zeros(num_reqs * 4, dtype=torch.int32),
-        seq_lens=torch.tensor(seq_lens + [0] * (knr - num_reqs), dtype=torch.int32),
+        block_tables=torch.from_numpy(owners),
+        seq_lens=torch.tensor(seq_lens + [0] * (KNR - num_reqs), dtype=torch.int32),
         query_start_loc=torch.tensor(
-            list(qsl) + [qsl[-1]] * (knr - num_reqs), dtype=torch.int32
+            list(qsl) + [qsl[-1]] * (KNR - num_reqs), dtype=torch.int32
         ),
         request_distribution=torch.tensor([0, num_reqs, num_reqs], dtype=torch.int32),
     )
@@ -385,69 +430,80 @@ def _scenario(mode: str):
         request_distribution=md.request_distribution,
         position_ids_override=None,
     )
-    chunk = DraftChunkInputs(
+    return DraftChunkInputs(
         input_ids=torch.from_numpy(input_ids),
         position_ids=torch.from_numpy(positions),
         query_start_loc_np=qsl,
         attn_ctx=attn_ctx,
-        start_index=0,
+        start_index=start,
         num_reqs=num_reqs,
         aux_hidden_states=[],
         hidden_states=hidden,
         attn_metadata={DRAFT_LAYER: md, "target.attn": md},
-        draft_lengths=torch.tensor([3, 0, 0], dtype=torch.int32),
+        draft_lengths=torch.tensor([sp.num_drafts for sp in specs], dtype=torch.int32),
     )
+
+
+def _scenario(mode: str, num_chunks: int):
+    chunk_specs = [_CHUNK0, _CHUNK1][:num_chunks]
+    specs = [sp for cs in chunk_specs for sp in cs]
+    chunks, start = [], 0
+    for cs, padded in zip(chunk_specs, (16, 8)):
+        chunks.append(_chunk(cs, start, padded))
+        start += len(cs)
     requests = {
-        "r2": _Req(list(range(100, 120)), _CONTEXT[2]),
+        sp.rid: _Req(list(range(100, 120)), sp.context) for sp in specs if sp.discard
     }
     kwargs = dict(
-        discard_sampled_tokens_req_indices=[2],
+        discard_sampled_tokens_req_indices=[
+            i for i, sp in enumerate(specs) if sp.discard
+        ],
         scheduler_output=SimpleNamespace(
-            num_scheduled_tokens={"r0": 4, "r1": 6, "r2": 5},
-            scheduled_spec_decode_tokens={"r0": [0, 0, 0]},
+            num_scheduled_tokens={sp.rid: sp.q_len for sp in specs},
+            scheduled_spec_decode_tokens={},
         ),
     )
     if mode == "sync":
         kwargs.update(
-            sampled_token_ids=[[11, 12], [13], []],
-            num_rejected_tokens_np=np.array(_REJECTED, dtype=np.int32),
+            sampled_token_ids=[list(sp.sampled) for sp in specs],
+            num_rejected_tokens_np=np.array(
+                [sp.rejected for sp in specs], dtype=np.int32
+            ),
         )
     else:
-        # The rejection-sampler output that gives the same seeds / rejections:
-        # r0 keeps 1 draft + bonus (2 of 4 valid -> 2 rejected).
+        # The rejection-sampler rows that give the same seeds and rejections.
         kwargs.update(
             sampled_token_ids=None,
             num_rejected_tokens_np=None,
             next_tokens_per_chunk=[
-                torch.tensor(
-                    [[11, 12, -1, -1], [13, -1, -1, -1], [0, -1, -1, -1]],
-                    dtype=torch.int32,
-                )
+                torch.tensor([sp.async_row for sp in cs], dtype=torch.int32)
+                for cs in chunk_specs
             ],
             return_device=True,
         )
-    prefix_lens = _CONTEXT
-    return chunk, requests, kwargs, prefix_lens, seq_lens
+    return chunks, requests, kwargs, [sp.context for sp in specs], specs
 
 
-def _run(monkeypatch, *, two_pass: bool, mode: str):
+def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
     import torch._dynamo
 
     torch._dynamo.reset()
-    chunk, requests, kwargs, prefix_lens, seq_lens = _scenario(mode)
-    world = _ToyWorld(3, 24, prefix_lens)
+    chunks, requests, kwargs, prefix_lens, specs = _scenario(mode, num_chunks)
+    world = _ToyWorld(len(specs), 24, prefix_lens)
     K = 3
 
     proposer = _make_proposer()
     proposer.speculative_config.num_speculative_tokens = K
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=3, req_ids=["r0", "r1", "r2"]),
+        input_batch=SimpleNamespace(
+            num_reqs=len(specs), req_ids=[sp.rid for sp in specs]
+        ),
         requests=requests,
         device=torch.device("cpu"),
         num_tokens_paddings=[4, 8, 16, 32],
         max_num_reqs=4,
-        num_reqs_max_model_len=4,
+        num_reqs_max_model_len=KNR,
         num_reqs_most_model_len=None,
         uses_mrope=False,
         mesh=object(),
@@ -458,14 +514,14 @@ def _run(monkeypatch, *, two_pass: bool, mode: str):
     )
     proposer._draft_attn_layer_names = {DRAFT_LAYER}
     proposer.draft_model = _ToyDraft(world)
-    proposer.draft_chunks = [chunk]
+    proposer.draft_chunks = chunks
     # IndexShare, on the toy's shared top-k table.
     proposer._share_mtp_indices = True
     proposer._mtp_topk_buffers = [world.topk_buf]
     proposer._mtp_loop_model = _ToyLoopProgram(world)
     proposer._mtp_loop_model_warm = True
 
-    monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 8)
+    monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", GATE)
     kv_only = _ToyKvOnly(world)
     proposer._mtp_kv_only_model = kv_only if two_pass else None
 
@@ -481,34 +537,32 @@ def _run(monkeypatch, *, two_pass: bool, mode: str):
     drafts = proposer.propose(**kwargs)
     if isinstance(drafts, torch.Tensor):
         drafts = drafts.tolist()
-    return SimpleNamespace(
-        drafts=drafts,
-        world=world,
-        kv_only_calls=kv_only.calls,
-        seq_lens=seq_lens,
-    )
+    return SimpleNamespace(drafts=drafts, world=world, kv_only_calls=kv_only.calls)
 
 
+@pytest.mark.parametrize("num_chunks", [1, 2])
 @pytest.mark.parametrize("mode", ["sync", "async"])
-def test_two_pass_step0_matches_the_single_pass(monkeypatch, mode):
-    ref = _run(monkeypatch, two_pass=False, mode=mode)
-    new = _run(monkeypatch, two_pass=True, mode=mode)
+def test_two_pass_step0_matches_the_single_pass(monkeypatch, mode, num_chunks):
+    ref = _run(monkeypatch, two_pass=False, mode=mode, num_chunks=num_chunks)
+    new = _run(monkeypatch, two_pass=True, mode=mode, num_chunks=num_chunks)
 
     # The paths actually differ: one full step 0 on all 16 rows vs a KV-only
-    # pass over the 15 real rows and a full pass on p = 4 rows.
+    # pass over the 15 real rows and a full pass on p = 4 rows. A second
+    # chunk (8 tokens) is below the gate and keeps the single pass.
     assert ref.kv_only_calls == 0
-    assert ref.world.step0_rows_seen == [16]
+    assert ref.world.step0_rows_seen == [16, 8][:num_chunks]
     assert new.kv_only_calls == 1
     assert new.world.kv_only_rows_seen == [15]
-    assert new.world.step0_rows_seen == [4]
+    assert new.world.step0_rows_seen == [4, 8][:num_chunks]
 
     assert new.drafts == ref.drafts
     # Same cache entries everywhere: prefix, this step's rows (rejected tail
     # included), and the K - 1 loop steps' draft entries.
     assert torch.equal(new.world.kv, ref.world.kv)
     assert torch.equal(new.world.idx, ref.world.idx)
-    # The loop steps' top-k rows (IndexShare) are the same per request.
-    assert torch.equal(new.world.topk_buf[:3], ref.world.topk_buf[:3])
+    # The last chunk's per-request top-k rows (IndexShare) are the same.
+    num_last = len(_CHUNK0 if num_chunks == 1 else _CHUNK1)
+    assert torch.equal(new.world.topk_buf[:num_last], ref.world.topk_buf[:num_last])
 
 
 def test_two_pass_step0_is_not_taken_below_the_gate(monkeypatch):

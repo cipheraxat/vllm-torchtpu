@@ -95,6 +95,46 @@ def kv_only_unsupported_reason(mtp: nn.Module | None) -> str | None:
         return "the Kimi fused MLA preprocess is not mirrored"
     if getattr(wrapper.indexer, "indexer_op", None) is None:
         return "the MTP indexer has no indexer op"
+    return _not_the_mirrored_classes(mtp, layer, wrapper)
+
+
+def _not_the_mirrored_classes(mtp: nn.Module, layer: nn.Module, wrapper: Any):
+    """Pass 1 duplicates the forwards of these exact classes (pinned bit-exact
+    by tests/layers/adapter/test_mla_kv_only.py). A subclass or a patched
+    forward may compute something else, so refuse it rather than drift."""
+    from vllm.model_executor.models.deepseek_mtp import (
+        DeepSeekMultiTokenPredictor,
+        DeepSeekMultiTokenPredictorLayer,
+    )
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUIndexer,
+        VllmTPUMultiHeadLatentAttentionWrapper,
+        VllmTPUSparseAttnIndexer,
+    )
+
+    forwards = (
+        (mtp.model, DeepSeekMultiTokenPredictor),
+        (layer, DeepSeekMultiTokenPredictorLayer),
+        (layer.mtp_block, DeepseekV2DecoderLayer),
+    )
+    for module, cls in forwards:
+        if type(module).forward is not cls.forward:
+            return f"{type(module).__name__}.forward is not {cls.__name__}.forward"
+    exact = (
+        (wrapper, VllmTPUMultiHeadLatentAttentionWrapper),
+        (wrapper.indexer, VllmTPUIndexer),
+        (wrapper.indexer.indexer_op, VllmTPUSparseAttnIndexer),
+        (
+            getattr(getattr(wrapper, "mla_attn", None), "impl", None),
+            PallasMLAttentionBackendImpl,
+        ),
+    )
+    for obj, cls in exact:
+        if type(obj) is not cls:
+            return f"{type(obj).__name__} is not exactly {cls.__name__}"
     return None
 
 
@@ -217,6 +257,166 @@ def _indexer_k_append_local(
     return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(k_packed)
 
 
+def write_caches_dcp(
+    nope: jax.Array,
+    rope: jax.Array,
+    idx_cache: jax.Array,
+    kv_c: jax.Array,
+    k_pe: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    qsl: jax.Array,
+    idx_seq_lens: jax.Array,
+    idx_pages: jax.Array,
+    idx_cu: jax.Array,
+    rank_ids: jax.Array | None,
+    *,
+    mla_kv_spec: tuple[Any, Any],
+    mesh: Any,
+    dcp_size: int,
+    interleave_size: int,
+    kv_cache_mode: str | None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Write one step's MLA latents and indexer-K rows into DCP position-
+    sharded caches (global arrays: caches sharded over the DCP axis, rows and
+    metadata replicated).
+
+    The MLA half is the shard_map `sparse_mla_attention_dcp` runs around
+    `update_sparse_mla_kv_cache_dcp`; the indexer half is the
+    `_cp_scatter_indexer_k` call of `_streamidx_topk_dcp_impl`, with the same
+    writer / layout resolution. `rank_ids` is the TPU_DCP_RANK_OPERAND operand.
+    """
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        DCP_AXIS_NAME,
+        cp_rank_as_data,
+    )
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        _cp_scatter_indexer_k,
+        _resolve_indexer_kv_cache_mode,
+    )
+
+    ax = DCP_AXIS_NAME
+    nope_spec, rope_spec = mla_kv_spec
+
+    def _local(nope_, rope_, kv_c_, k_pe_, sl_, bt_, qsl_, *rank_):
+        rank = rank_[0][0] if rank_ else cp_rank_as_data(ax, dcp_size)
+        return kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+            nope_,
+            rope_,
+            kv_c_,
+            k_pe_,
+            sl_,
+            bt_,
+            qsl_,
+            rank,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    rank_args = () if rank_ids is None else (rank_ids,)
+    in_specs = (
+        P(ax),
+        P(ax),
+        P(None, None),
+        P(None, None),
+        P(None),
+        P(None),
+        P(None),
+    ) + (P(ax),) * len(rank_args)
+    nope, rope = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=(P(ax), P(ax)),
+            check_vma=False,
+        )
+    )(nope, rope, kv_c, k_pe, seq_lens, block_tables, qsl, *rank_args)
+    writer, kv_layout = _resolve_indexer_kv_cache_mode(
+        idx_cache, k_packed, mode=kv_cache_mode
+    )
+    idx_cache = _cp_scatter_indexer_k(
+        idx_cache,
+        k_packed,
+        idx_seq_lens,
+        idx_pages,
+        idx_cu,
+        mesh=mesh,
+        cp_size=dcp_size,
+        interleave_size=interleave_size,
+        axis_name=ax,
+        writer=writer,
+        kv_layout=kv_layout,
+        rank_ids=rank_ids,
+    )
+    return nope, rope, idx_cache
+
+
+def write_caches(
+    nope: jax.Array,
+    rope: jax.Array,
+    idx_cache: jax.Array,
+    kv_c: jax.Array,
+    k_pe: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    qsl: jax.Array,
+    idx_seq_lens: jax.Array,
+    idx_pages: jax.Array,
+    idx_cu: jax.Array,
+    *,
+    mla_kv_spec: tuple[Any, Any],
+    mesh: Any,
+    kv_cache_mode: str | None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The unsharded twin of `write_caches_dcp`: the replicated shard_map
+    `sparse_mla_attention` runs around `update_sparse_mla_kv_cache`, and the
+    indexer append of `_build_streamidx_op`."""
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+
+    nope_spec, rope_spec = mla_kv_spec
+
+    def _local(nope_, rope_, kv_c_, k_pe_, sl_, bt_, qsl_):
+        return kv_cache_utils.update_sparse_mla_kv_cache(
+            nope_,
+            rope_,
+            kv_c_,
+            k_pe_,
+            sl_,
+            bt_,
+            qsl_,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+        )
+
+    nope, rope = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(
+                P(None),
+                P(None),
+                P(None, None),
+                P(None, None),
+                P(None),
+                P(None),
+                P(None),
+            ),
+            out_specs=(P(None), P(None)),
+            check_vma=False,
+        )
+    )(nope, rope, kv_c, k_pe, seq_lens, block_tables, qsl)
+    idx_cache = _indexer_k_append_local(
+        idx_cache, k_packed, idx_seq_lens, idx_pages, idx_cu, kv_cache_mode
+    )
+    return nope, rope, idx_cache
+
+
 class _KvOnlyWriteOp:
     """One op per MTP layer that writes its MLA KV and indexer-K rows.
 
@@ -234,20 +434,9 @@ class _KvOnlyWriteOp:
             dcp_rank_operand,
             get_or_create_dcp_mesh,
         )
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-            DCP_AXIS_NAME,
-            cp_rank_as_data,
-        )
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
         from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
             pcp_streaming_jax_op,
-        )
-        from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-            update_sparse_mla_kv_cache,
-            update_sparse_mla_kv_cache_dcp,
-        )
-        from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
-            _cp_scatter_indexer_k,
-            _resolve_indexer_kv_cache_mode,
         )
 
         self.wrapper = wrapper
@@ -285,77 +474,16 @@ class _KvOnlyWriteOp:
             dcp_mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
             ax = DCP_AXIS_NAME
 
-            def _write_dcp(
-                nope,
-                rope,
-                idx_cache,
-                kv_c,
-                k_pe,
-                k_packed,
-                seq_lens,
-                block_tables,
-                qsl,
-                idx_seq_lens,
-                idx_pages,
-                idx_cu,
-                rank_ids,
-            ):
-                nope_spec, rope_spec = mla_layer.mla_kv_spec
-
-                def _local(nope_, rope_, kv_c_, k_pe_, sl_, bt_, qsl_, *rank_):
-                    rank = rank_[0][0] if rank_ else cp_rank_as_data(ax, dcp_size)
-                    return update_sparse_mla_kv_cache_dcp(
-                        nope_,
-                        rope_,
-                        kv_c_,
-                        k_pe_,
-                        sl_,
-                        bt_,
-                        qsl_,
-                        rank,
-                        nope_spec=nope_spec,
-                        rope_spec=rope_spec,
-                        dcp_size=dcp_size,
-                        interleave_size=interleave,
-                    )
-
-                rank_args = () if rank_ids is None else (rank_ids,)
-                in_specs = (
-                    P(ax),
-                    P(ax),
-                    P(None, None),
-                    P(None, None),
-                    P(None),
-                    P(None),
-                    P(None),
-                ) + (P(ax),) * len(rank_args)
-                nope, rope = jax.jit(
-                    jax.shard_map(
-                        _local,
-                        mesh=dcp_mesh,
-                        in_specs=in_specs,
-                        out_specs=(P(ax), P(ax)),
-                        check_vma=False,
-                    )
-                )(nope, rope, kv_c, k_pe, seq_lens, block_tables, qsl, *rank_args)
-                writer, kv_layout = _resolve_indexer_kv_cache_mode(
-                    idx_cache, k_packed, mode=kv_cache_mode
-                )
-                idx_cache = _cp_scatter_indexer_k(
-                    idx_cache,
-                    k_packed,
-                    idx_seq_lens,
-                    idx_pages,
-                    idx_cu,
+            def _kwargs():
+                # `mla_kv_spec` is recorded when the caches are allocated,
+                # after this op is built, so it is read at trace time.
+                return dict(
+                    mla_kv_spec=mla_layer.mla_kv_spec,
                     mesh=dcp_mesh,
-                    cp_size=dcp_size,
+                    dcp_size=dcp_size,
                     interleave_size=interleave,
-                    axis_name=ax,
-                    writer=writer,
-                    kv_layout=kv_layout,
-                    rank_ids=rank_ids,
+                    kv_cache_mode=kv_cache_mode,
                 )
-                return nope, rope, idx_cache
 
             # Fixed arity: torch custom-op schemas take no varargs.
             def _write_dcp_jax(
@@ -372,7 +500,7 @@ class _KvOnlyWriteOp:
                 idx_pages: jax.Array,
                 idx_cu: jax.Array,
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
-                return _write_dcp(
+                return write_caches_dcp(
                     nope,
                     rope,
                     idx_cache,
@@ -386,6 +514,7 @@ class _KvOnlyWriteOp:
                     idx_pages,
                     idx_cu,
                     None,
+                    **_kwargs(),
                 )
 
             def _write_dcp_rank_jax(
@@ -403,7 +532,7 @@ class _KvOnlyWriteOp:
                 idx_cu: jax.Array,
                 rank_ids: jax.Array,
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
-                return _write_dcp(
+                return write_caches_dcp(
                     nope,
                     rope,
                     idx_cache,
@@ -417,6 +546,7 @@ class _KvOnlyWriteOp:
                     idx_pages,
                     idx_cu,
                     rank_ids,
+                    **_kwargs(),
                 )
 
             if envs.TPU_DCP_RANK_OPERAND:
@@ -452,47 +582,23 @@ class _KvOnlyWriteOp:
                 idx_pages: jax.Array,
                 idx_cu: jax.Array,
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
-                nope_spec, rope_spec = mla_layer.mla_kv_spec
-
-                def _local(nope_, rope_, kv_c_, k_pe_, sl_, bt_, qsl_):
-                    return update_sparse_mla_kv_cache(
-                        nope_,
-                        rope_,
-                        kv_c_,
-                        k_pe_,
-                        sl_,
-                        bt_,
-                        qsl_,
-                        nope_spec=nope_spec,
-                        rope_spec=rope_spec,
-                    )
-
-                nope, rope = jax.jit(
-                    jax.shard_map(
-                        _local,
-                        mesh=mesh,
-                        in_specs=(
-                            P(None),
-                            P(None),
-                            P(None, None),
-                            P(None, None),
-                            P(None),
-                            P(None),
-                            P(None),
-                        ),
-                        out_specs=(P(None), P(None)),
-                        check_vma=False,
-                    )
-                )(nope, rope, kv_c, k_pe, seq_lens, block_tables, qsl)
-                idx_cache = _indexer_k_append_local(
+                return write_caches(
+                    nope,
+                    rope,
                     idx_cache,
+                    kv_c,
+                    k_pe,
                     k_packed,
+                    seq_lens,
+                    block_tables,
+                    qsl,
                     idx_seq_lens,
                     idx_pages,
                     idx_cu,
-                    kv_cache_mode,
+                    mla_kv_spec=mla_layer.mla_kv_spec,
+                    mesh=mesh,
+                    kv_cache_mode=kv_cache_mode,
                 )
-                return nope, rope, idx_cache
 
             self.jax_op = pallas.jax_op(
                 f"pallas::mtp_kv_only_write_{name}",
@@ -518,20 +624,21 @@ class _KvOnlyWriteOp:
 
         md, _, kv_cache, _ = get_attention_context(layer.layer_name)
         fwd_md = get_forward_context().attn_metadata
-        idx_md = (
-            fwd_md.get(self.indexer_op.k_cache.prefix)
-            if isinstance(fwd_md, dict)
-            else None
-        )
+        idx_prefix = self.indexer_op.k_cache.prefix
+        idx_md = fwd_md.get(idx_prefix) if isinstance(fwd_md, dict) else None
         idx_cache = self.indexer_op.k_cache.kv_cache
         # The memory probe runs before the caches are bound; write nothing.
-        if (
-            not isinstance(kv_cache, (tuple, list))
-            or not isinstance(md, AttentionMetadata)
-            or not isinstance(idx_md, AttentionMetadata)
-            or idx_cache.numel() == 0
-        ):
+        if not isinstance(kv_cache, (tuple, list)) or idx_cache.numel() == 0:
             return k_pe
+        # Bound caches without metadata would leave pass 2 reading stale rows,
+        # i.e. silently wrong drafts: refuse instead.
+        if not isinstance(md, AttentionMetadata) or not isinstance(
+            idx_md, AttentionMetadata
+        ):
+            raise RuntimeError(
+                "MTP KV-only pass: no attention metadata for "
+                f"{layer.layer_name!r} or {idx_prefix!r}"
+            )
 
         _, k_scale, _ = self.impl._get_kv_scales(layer)
         if layer.kv_cache_quantized_dtype is not None:
@@ -565,6 +672,10 @@ class _KvOnlyWriteOp:
         rope.copy_(new_rope)
         idx_cache.copy_(new_idx)
         return k_pe
+
+    def cache_layer_names(self) -> tuple[str, str]:
+        """The two forward-context keys this op reads its metadata from."""
+        return self.mla_layer.layer_name, self.indexer_op.k_cache.prefix
 
 
 def mtp_layer_input(
@@ -611,6 +722,10 @@ class MtpKvOnlyModel(nn.Module):
         layer = _single_mtp_layer(mtp)
         assert layer is not None
         self._write = _KvOnlyWriteOp(layer.mtp_block.self_attn.mla_attn, mesh)
+
+    def cache_layer_names(self) -> tuple[str, str]:
+        """The MLA layer and indexer cache whose step-0 metadata pass 1 reads."""
+        return self._write.cache_layer_names()
 
     def forward(
         self,
