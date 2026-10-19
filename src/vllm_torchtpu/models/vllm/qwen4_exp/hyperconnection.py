@@ -95,19 +95,17 @@ class GatedResidual(common_hc.GatedResidual):
             )
             return mixed, (hyper_input, norm)
         norm = self._normalize(hyper_input)
-        gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
+        gate = F.linear(norm, self.input_mix_weight_down.weight)
         # TorchTPU can lower BF16 SiLU through BF16 logistic/tanh, rounding
         # negative tails to zero. Compute the activation in FP32 and round
         # once, matching NVIDIA hc_silu's BF16 result boundary.
-        gate = F.silu(gate.float()).to(gate.dtype)
+        gate = F.silu(gate.float() / self.hc_count).to(gate.dtype)
         gate = F.linear(gate, self.input_mix_weight_up.weight)
-        gate = torch.sigmoid(gate.float()).unflatten(
-            -1, (self.hc_count, self.hidden_size)
-        )
+        gate = torch.sigmoid(gate.float())
         # Reduce the HC streams in the flat matmul-output layout. Unflattening
         # to [tokens, hc_count, hidden_size] forces an F32 layout conversion at
         # prefill sizes, while these fixed branch slices fuse into one reduction.
-        weighted = gate.flatten(-2) * norm.float()
+        weighted = gate * norm.float()
         mixed = weighted[..., : self.hidden_size]
         for branch in range(1, self.hc_count):
             start = branch * self.hidden_size

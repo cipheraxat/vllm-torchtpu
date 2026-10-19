@@ -26,42 +26,46 @@ def cpu_default(request):
             yield
 
 
-def hc_fixture(per_branch):
+def hc_fixture(per_branch, tokens=3, branches=4, hidden=2560, full_tile=0):
     # Seed only CPU: torch.manual_seed also initializes registered accelerators.
     torch.random.default_generator.manual_seed(383)
     config = HyperConnectionConfig(
-        hidden_size=2560, hc_count=4, hc_lowrank=320, hc_per_branch_norm=per_branch
+        hidden_size=hidden,
+        hc_count=branches,
+        hc_lowrank=320,
+        hc_per_branch_norm=per_branch,
     )
-    module = GatedResidual(config)
+    module = GatedResidual(config, prefill_full_tile=full_tile)
     with torch.no_grad():
         module.hc_norm.weight.copy_(torch.randn_like(module.hc_norm.weight) * 0.1)
     x = (
-        torch.randn(3, 4, 2560, device="cpu")
-        + torch.arange(4, device="cpu")[None, :, None]
+        torch.randn(tokens, branches, hidden, device="cpu")
+        + torch.arange(branches, device="cpu")[None, :, None]
     ).bfloat16()
-    block = torch.randn(3, 2560, device="cpu").bfloat16()
+    block = torch.randn(tokens, hidden, device="cpu").bfloat16()
     return module, x.flatten(1), block
 
 
 def hc_cuda_source_reference(module, flat, block):
     """Reference the BF16 load/store boundaries in NVIDIA HC kernels."""
-    x = flat.reshape(-1, 4, 2560).float()
-    weight = module.hc_norm.weight.float().reshape(-1, 2560)
+    branches, hidden = module.hc_count, module.hidden_size
+    x = flat.reshape(-1, branches, hidden).float()
+    weight = module.hc_norm.weight.float().reshape(-1, hidden)
     norm = (
         (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * (1 + weight))
         .bfloat16()
         .flatten(1)
     )
     down = F.linear(norm, module.input_mix_weight_down.weight)
-    silu = F.silu(down.float() / 4).bfloat16()
+    silu = F.silu(down.float() / branches).bfloat16()
     gate = F.linear(silu, module.input_mix_weight_up.weight)
-    gate = torch.sigmoid(gate.float()).reshape(-1, 4, 2560)
-    mixed = (gate * norm.float().reshape(-1, 4, 2560)).mean(1).bfloat16()
+    gate = torch.sigmoid(gate.float()).reshape(-1, branches, hidden)
+    mixed = (gate * norm.float().reshape(-1, branches, hidden)).mean(1).bfloat16()
     inject = F.linear(norm, module.block_inject_weight.weight)
-    inject = 2 * torch.sigmoid(inject.float() / 4)
+    inject = 2 * torch.sigmoid(inject.float() / branches)
     output = (
         (
-            flat.float().reshape(-1, 4, 2560)
+            flat.float().reshape(-1, branches, hidden)
             + block.float()[:, None] * inject[:, :, None]
         )
         .bfloat16()
@@ -187,10 +191,6 @@ def _np(tensor):
     return np.asarray(tensor.detach().float().numpy(), np.float32)
 
 
-def _bf(x):
-    return torch.as_tensor(np.asarray(x).copy()).bfloat16().float().numpy()
-
-
 def assert_metrics(actual, expected, threshold=0.01):
     a, e = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
     nrmse = np.linalg.norm(a - e) / max(np.linalg.norm(e), 1e-8)
@@ -258,3 +258,84 @@ def test_hc_tpu_negative_silu_preserves_mix_gate(compiled):
     with torch.inference_mode():
         actual = run(torch.ones(43, 10240, dtype=torch.bfloat16, device="tpu"))
     assert_metrics(_np(actual.cpu()), expected)
+
+
+@pytest.mark.parametrize("branches", [3, 4])
+def test_hc_silu_divides_in_fp32(branches):
+    module, x, block = hc_fixture(True, branches=branches, hidden=128)
+    expected = hc_cuda_source_reference(module, x, block)
+    mixed, residual = module.mix(x)
+    torch.testing.assert_close(mixed, expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.combine(block, residual), expected[1], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("tile", [-128, 64, 129])
+def test_hc_rejects_invalid_full_tile(tile):
+    with pytest.raises(ValueError, match="multiple of 128"):
+        hc_fixture(True, full_tile=tile)
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden,dtype,full_tile,expected",
+    [
+        (256, 128, torch.bfloat16, 128, True),
+        (128, 128, torch.bfloat16, 128, False),
+        (257, 128, torch.bfloat16, 128, False),
+        (256, 129, torch.bfloat16, 128, False),
+        (256, 128, torch.float32, 128, False),
+        (256, 128, torch.bfloat16, 0, False),
+    ],
+)
+def test_hc_full_dispatch_and_fallback(tokens, hidden, dtype, full_tile, expected):
+    module, x, block = hc_fixture(
+        True, tokens=tokens, hidden=hidden, full_tile=full_tile
+    )
+    module, x, block = module.to(dtype), x.to(dtype), block.to(dtype)
+    calls = []
+
+    def full(hyper_input, weight, down, up):
+        calls.append("mix")
+        return hyper_input[:, :hidden], hyper_input
+
+    def combine(hyper_input, block_output, injection):
+        calls.append("combine")
+        return hyper_input
+
+    if module._prefill_full_op is not None:
+        module._prefill_full_op = full
+    if module._prefill_combine_op is not None:
+        module._prefill_combine_op = combine
+    mixed, residuals = module.mix(x)
+    result = module.combine(block, residuals)
+    assert calls == (["mix", "combine"] if expected else [])
+    assert mixed.shape == (tokens, hidden)
+    assert result.shape == x.shape
+    assert mixed.dtype == result.dtype == dtype
+
+
+@TPU
+@pytest.mark.parametrize("compiled", [False, True])
+def test_hc_tpu_full_mix_and_combine(compiled):
+    with torch.device("cpu"):
+        module, x, block = hc_fixture(True, tokens=256, full_tile=128)
+        expected = hc_cuda_source_reference(module, x, block)
+    assert module._prefill_full_op is not None
+    assert module._prefill_combine_op is not None
+    module = module.to("tpu")
+
+    def chain(hyper_input, block_output):
+        mixed, residuals = module.mix(hyper_input)
+        return mixed, module.combine(block_output, residuals)
+
+    run = (
+        torch.compile(chain, backend="tpu", fullgraph=True, dynamic=False)
+        if compiled
+        else chain
+    )
+    with torch.inference_mode():
+        actual = run(x.to("tpu"), block.to("tpu"))
+    for a, e in zip(actual, expected, strict=True):
+        assert np.isfinite(_np(a.cpu())).all()
+        assert_metrics(_np(a.cpu()), _np(e))
