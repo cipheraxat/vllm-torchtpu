@@ -10,7 +10,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
-from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
+from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+    PAIRED_PAGE_VMEM_MIB,
+    supports_paired_prefill,
+)
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
@@ -282,26 +285,13 @@ def block_sparse_gqa_prefill(
         raise ValueError("Token rows must form aligned query blocks")
     paired_pages = kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4
     if paired_pages:
-        if (
-            query_heads != 24
-            or kv_heads != 2
-            or head_dim != 256
-            or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
-            or (
-                cache.dtype == jnp.bfloat16
-                and (
-                    query_block != 256
-                    or physical_page_size not in (128, 1664)
-                    or (head_axis, packing, cache_dim) != (2, 2, 256)
-                    or pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X
-                )
-            )
-            or query_block not in PAIRED_PAGE_VMEM_MIB
-            or not bf16_io
+        if not bf16_io or not supports_paired_prefill(
+            query, cache, kv_heads=kv_heads, ratio=ratio, query_block=query_block
         ):
             raise ValueError(
-                "Paired pages require BF16 Q24/KV2/D256 with FP8 cache, or "
-                "TPU7x BF16 cache with Q256 and page size 128/1664"
+                "Paired pages require BF16 queries, native BF16/FP8 KV, "
+                "128-aligned pages/dimensions and a TPU7x tile "
+                "within the paired VMEM footprint"
             )
     elif kv_tile // ratio != 32 or max(physical_page_size, kv_tile) % min(
         physical_page_size, kv_tile
@@ -552,7 +542,9 @@ def block_sparse_gqa_attention(
         output = run_with_padding(None)
     else:
         output = lax.cond(
-            jnp.all(real % query_block == 0),
+            # Only starts of nonempty requests must align. The final request
+            # may end inside a tile whose remaining token rows are inactive.
+            jnp.all((starts[:-1] % query_block == 0) | (real == 0)),
             run_aligned,
             run_with_padding,
             None,

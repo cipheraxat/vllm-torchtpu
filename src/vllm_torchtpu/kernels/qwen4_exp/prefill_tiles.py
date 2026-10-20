@@ -1,62 +1,80 @@
 # SPDX-License-Identifier: Apache-2.0
-"""QSA prefill tile choices."""
+"""QSA prefill tiles selected from per-rank layout and resource bounds."""
 
 import jax
+import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
-
-# Query block -> scoped VMEM MiB. FP8 Q256/KV256 compiles to 61.13 MiB on v7;
-# Q128 is retained for environments where the full graph cannot spare 62 MiB.
+# Scoped compiler budgets, below TPU7x's 64 MiB per core. The reference
+# Q256/H24/D256 paired kernel compiles to 61.13 MiB with FP8 KV.
 PAIRED_PAGE_VMEM_MIB = {128: 61, 256: 62}
 
-# (chip, tokens, query heads, KV heads, head dim, compression ratio,
-#  physical cache page shape, query dtype, cache dtype) -> (query block, KV tile).
-# T8192, contexts 0/8192, uniform/recent selections: Q256/KV256 reduced isolated
-# latency 22-37% relative to Q256/KV128 with FP32 attention accumulation.
-# The unified serving pool uses 1664-token pages (13 mask segments);
-# dedicated attention caches use 128. Both require segment-wise addressing.
-# BF16 uses the same paired tiles with native two-value packing.
-SPARSE_PREFILL_TILES = {
-    (
-        pltpu.ChipVersion.TPU_7X,
-        8192,
-        24,
-        2,
-        256,
-        4,
-        (page_size, 4 // packing, packing, 256),
-        "bfloat16",
-        cache_dtype,
-    ): (256, 256)
-    for page_size in (128, 1664)
-    for cache_dtype, packing in (("float8_e4m3fn", 4), ("bfloat16", 2))
-}
+
+def _paired_working_set(
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    packing: int,
+    item_bytes: int,
+    query_block: int,
+) -> int:
+    # FP32 Q/accumulator, softmax scores/probabilities and max/mass, BF16 Q,
+    # and two native KV DMA buffers. This is a relative resource bound, not
+    # an exact compiler VMEM prediction (layouts/temporaries add overhead).
+    rows = query_block * query_heads
+    query_state = rows * ((2 * head_dim + 2 * 256 + 2) * 4 + head_dim * 2)
+    native_heads = (2 * kv_heads + packing - 1) // packing * packing
+    return query_state + 2 * 256 * native_heads * head_dim * item_bytes
+
+
+def supports_paired_prefill(
+    query: jax.Array, cache: jax.Array, *, kv_heads: int, ratio: int, query_block: int
+) -> bool:
+    """Check segment addressing, packing and the validated VMEM footprint.
+
+    Token count is not a tile resource. Head counts are local geometry, with
+    no assumption about tensor-parallel degree or the GQA ratio. Other shapes
+    retain the general one-selection-word TC kernel. SparseCore's calibrated
+    costs are deliberately separate from this TC layout/resource policy.
+    """
+    if query.ndim != 3 or cache.ndim != 5 or kv_heads <= 0:
+        return False
+    _, heads, dim = query.shape
+    if (
+        heads <= 0
+        or heads % kv_heads
+        or dim <= 0
+        or dim % 128
+        or query.dtype != jnp.bfloat16
+        or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
+        or ratio != 4
+        or query_block not in PAIRED_PAGE_VMEM_MIB
+        or cache.shape[1] <= 0
+        or cache.shape[1] % 128
+        or pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X
+    ):
+        return False
+    item_bytes = jax.dtypes.itemsize_bits(cache.dtype) // 8
+    packing = 4 // item_bytes
+    if cache.shape[2:] != ((2 * kv_heads + packing - 1) // packing, packing, dim):
+        return False
+    reference = _paired_working_set(24, 2, 256, 2, 2, 256)
+    return (
+        _paired_working_set(heads, kv_heads, dim, packing, item_bytes, query_block)
+        <= reference
+    )
 
 
 def get_sparse_prefill_tiles(
     query: jax.Array, cache: jax.Array, *, kv_heads: int, ratio: int
 ) -> tuple[int, int]:
-    """Select measured tiles, otherwise use one 32-group selection word."""
-    tokens, query_heads, head_dim = query.shape
-    key = (
-        pltpu.get_tpu_info().chip_version,
-        tokens,
-        query_heads,
-        kv_heads,
-        head_dim,
-        ratio,
-        cache.shape[1:],
-        str(query.dtype),
-        str(cache.dtype),
-    )
-    if key not in SPARSE_PREFILL_TILES:
-        logger.warning_once("QSA uses default prefill tiles for key: %s", key)
-        # Keep query/state windows within the measured Q24/D256 footprint
-        # when fewer TP shards give this rank more attention heads.
-        rows = max(8, 256 * 24 * 256 // (query_heads * cache.shape[-1]))
-        query_block = min(256, 1 << (rows.bit_length() - 1))
-        return query_block, ratio * 32
-    return SPARSE_PREFILL_TILES[key]
+    """Use paired tiles within their footprint, independent of token bucket."""
+    for query_block in (256, 128):
+        if supports_paired_prefill(
+            query, cache, kv_heads=kv_heads, ratio=ratio, query_block=query_block
+        ):
+            return query_block, 256
+    # Bound query/state windows by the Q24/D256 footprint for other layouts.
+    rows = max(8, 256 * 24 * 256 // (query.shape[1] * cache.shape[-1]))
+    query_block = min(256, 1 << (rows.bit_length() - 1))
+    return query_block, ratio * 32

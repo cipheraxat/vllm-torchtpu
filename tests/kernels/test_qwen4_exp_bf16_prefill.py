@@ -118,8 +118,8 @@ def test_measured_prefill_tiles_include_bf16_cache(tpu_info, page_size, dtype, p
 @pytest.mark.parametrize(
     "tokens,page_size,chip",
     [
-        (512, 128, pltpu.ChipVersion.TPU_7X),
-        (8192, 256, pltpu.ChipVersion.TPU_7X),
+        (512, 129, pltpu.ChipVersion.TPU_7X),
+        (8192, 129, pltpu.ChipVersion.TPU_7X),
         (8192, 128, pltpu.ChipVersion.TPU_V6E),
     ],
 )
@@ -138,8 +138,8 @@ def test_bf16_prefill_unmeasured_shapes_keep_single_word_tiles(
 @pytest.mark.parametrize(
     "query_block,page_size,head_axis,packing,dim,dtype",
     [
-        (128, 128, 2, 2, 256, jnp.bfloat16),
-        (256, 256, 2, 2, 256, jnp.bfloat16),
+        (64, 128, 2, 2, 256, jnp.bfloat16),
+        (256, 129, 2, 2, 256, jnp.bfloat16),
         (256, 128, 3, 2, 256, jnp.bfloat16),
         (256, 128, 2, 2, 384, jnp.bfloat16),
         (256, 128, 4, 1, 256, jnp.float32),
@@ -149,7 +149,9 @@ def test_paired_prefill_rejects_unvalidated_cache_geometry(
     tpu_info, query_block, page_size, head_axis, packing, dim, dtype
 ):
     shape = jax.ShapeDtypeStruct
-    with pytest.raises(ValueError, match="Paired pages require"):
+    with pytest.raises(
+        ValueError, match="Paired pages require|selection word or two mask segments"
+    ):
         jax.eval_shape(
             functools.partial(
                 block_sparse_gqa_prefill,
