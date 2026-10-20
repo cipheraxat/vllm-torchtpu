@@ -48,7 +48,7 @@ MTP_KV_ONLY_DYNAMIC_ARG_DIMS: dict[str, int | list[int] | dict[int, str]] = {
 }
 
 
-def _single_mtp_layer(mtp: nn.Module) -> nn.Module | None:
+def _single_mtp_layer(mtp: Any) -> Any:
     predictor = getattr(mtp, "model", None)
     layers: Any = getattr(predictor, "layers", None)
     if not isinstance(layers, nn.ModuleDict):
@@ -61,7 +61,7 @@ def _single_mtp_layer(mtp: nn.Module) -> nn.Module | None:
     return layers[str(start)]
 
 
-def kv_only_unsupported_reason(mtp: nn.Module | None) -> str | None:
+def kv_only_unsupported_reason(mtp: Any) -> str | None:
     """Why pass 1 cannot serve this draft, or None when it can.
 
     Pass 1 mirrors one specific forward: a single-layer `DeepSeekMTP` whose
@@ -103,7 +103,7 @@ def kv_only_unsupported_reason(mtp: nn.Module | None) -> str | None:
     return _not_the_mirrored_classes(mtp, layer, wrapper)
 
 
-def _not_the_mirrored_classes(mtp: nn.Module, layer: nn.Module, wrapper: Any):
+def _not_the_mirrored_classes(mtp: Any, layer: Any, wrapper: Any):
     """Pass 1 duplicates the forwards of these exact classes (pinned bit-exact
     by tests/layers/adapter/test_mla_kv_only.py). A subclass or a patched
     forward may compute something else, so refuse it rather than drift."""
@@ -144,7 +144,7 @@ def _not_the_mirrored_classes(mtp: nn.Module, layer: nn.Module, wrapper: Any):
 
 
 def mla_kv_latents(
-    wrapper: nn.Module, positions: torch.Tensor, hidden_states: torch.Tensor
+    wrapper: Any, positions: torch.Tensor, hidden_states: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`(kv_c_normed, k_pe)` exactly as `VllmTPUMultiHeadLatentAttentionWrapper
     .forward` hands them to the MLA attention, without the q path.
@@ -191,10 +191,10 @@ def mla_kv_latents(
 
 
 def indexer_k_packed(
-    indexer: nn.Module,
+    indexer: Any,
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
-    rotary_emb: nn.Module,
+    rotary_emb: Any,
 ) -> torch.Tensor:
     """The packed fp8 + e8m0 indexer K rows `VllmTPUIndexer.forward` and
     `VllmTPUSparseAttnIndexer._forward_impl` write into the indexer cache."""
@@ -431,7 +431,7 @@ class _KvOnlyWriteOp:
     replicated, and each rank keeps only the rows it owns.
     """
 
-    def __init__(self, wrapper: nn.Module, mesh: Any) -> None:
+    def __init__(self, wrapper: Any, mesh: Any) -> None:
         from torch_tpu._internal import pallas
 
         from vllm_torchtpu import envs
@@ -684,7 +684,7 @@ class _KvOnlyWriteOp:
 
 
 def mtp_layer_input(
-    mtp: nn.Module,
+    mtp: Any,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,

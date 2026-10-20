@@ -697,6 +697,8 @@ class Eagle3Proposer:
 
             reason = kv_only_unsupported_reason(self.draft_model)
         if reason is None:
+            # kv_only_unsupported_reason refuses a missing draft.
+            assert self.draft_model is not None
             try:
                 from vllm_torchtpu.spec_decode.mtp_kv_only import MtpKvOnlyModel
 
