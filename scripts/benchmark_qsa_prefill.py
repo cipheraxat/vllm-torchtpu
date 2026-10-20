@@ -6,7 +6,7 @@ Run on an allocated TPU with the repository's pinned dependencies:
 
 For BF16 paired-page A/B, add --cache-dtype bfloat16 --baseline kv128.
 For adaptive vs paired prefill, add --candidate adaptive --baseline paired.
-Adaptive requires page1664 and its documented single-request envelope.
+Adaptive requires page1664 and its documented calibration/metadata envelope.
 
 Includes selection metadata, attention and output gating; excludes the indexer,
 cache writes, compilation and warmup. Does not benchmark decode or a model.

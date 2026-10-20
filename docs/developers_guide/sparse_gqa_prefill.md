@@ -117,5 +117,46 @@ It includes dispatch, selection metadata, gather, attention and gating;
 excludes indexer scoring, cache writes, compilation and other model layers.
 The 128K final KV case is an 8K query chunk plus 120K cached history.
 
-Full model execution, Torch bridge behavior, concurrent requests and larger
-shared cache pools require separate validation. Decode is outside this kernel.
+The separate QSA integration tests exercise real runner-derived metadata,
+the native metadata builder, Qwen adapter and pooled custom op/indexer in direct
+and fullgraph TPU calls. Scheduler/storage/page ownership and projected inputs
+are fixtures; these are not checkpoint, full-model or distributed-TP tests.
+The captured FP8 long-context call executes SC in direct, compiled and repeated
+compiled markers. Large setup copies occur before those markers. This does not
+establish universal copy absence or runtime peak HBM. Full-model execution,
+concurrent serving and larger pools still require separate validation.
+Decode is outside this standalone kernel.
+
+## Reproduce the review A/B
+
+`scripts/benchmark_qsa_prefill_ab.py` preserves the measured seeds, data,
+shuffled physical pages, selected groups and padded request starts. It uses
+three warmups and ten synchronized, alternating measurements per arm.
+The baseline is the clean pre-review commit
+`d3b574ec1f560ec45bb71c76a9258b8af9084d2a`; it uses adaptive where originally
+supported and that checkout's TC tiles otherwise. Both arms consume identical
+arrays. Setup, compilation, indexer scoring and cache writes are excluded;
+dispatch, selector metadata, attention and gating are included. Calls consume
+only output, without donation. JSON records raw samples, summaries, source and
+dependency hashes/versions, HLO fingerprints and device names.
+
+```bash
+git worktree add --detach /path/on/data-disk/qsa-baseline d3b574ec1
+PYTHONPATH=src python scripts/benchmark_qsa_prefill_ab.py --list-cases
+PYTHONPATH=src python scripts/benchmark_qsa_prefill_ab.py \
+  --baseline-checkout /path/on/data-disk/qsa-baseline \
+  --output /path/on/data-disk/qsa-ab-results \
+  --cases common-fp8-tc common-fp8-sc common-bf16-tc common-bf16-sc \
+    runner-padded-common tail8448-padded tail8448-gcd-control \
+    long16640-recent long16640-uniform short512-bf16 local12-kv1 local8-kv4 \
+    short17-bf16
+```
+
+`--list-cases` exposes exact token/context counts, local Q/KV heads, page sizes,
+KV types and padding for all cases. These include page896, multiple GQA ratios
+and repeated padded starts; no TP degree is an implementation input. The nine
+adaptive cases were rerun on the final kernel. Four TC cases retain measurements
+from an earlier snapshot whose invoked TC/tiling/rounding files are byte-identical.
+The listed command reproduces those thirteen comparisons; it does not claim
+that packaging the CLI is a new hardware run. Limited measurements are not a
+universal latency guarantee.
