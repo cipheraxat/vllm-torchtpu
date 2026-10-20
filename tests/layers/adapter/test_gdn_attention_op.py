@@ -235,6 +235,7 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
+    @pytest.mark.parametrize("conv_dtype", [torch.bfloat16, torch.float32])
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
         self,
         mock_get_pcp_mesh,
@@ -244,8 +245,11 @@ class TestVllmGatedDeltaNetAttention:
         projection_dtype,
         interleaved,
         cpu_vllm_config_context,
+        conv_dtype,
     ):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
+        if conv_dtype != torch.bfloat16:
+            attn._pooled_conv_state_dtype = conv_dtype
         attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8, "tp": 1})
@@ -299,6 +303,9 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (4,)
         assert mock_run.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
             expected_dtype
+        )
+        assert mock_run.call_args.kwargs["conv_state_dtype"] == jnp.dtype(
+            jnp.float32 if conv_dtype == torch.float32 else jnp.bfloat16
         )
         op_args = fake_jax_op.call_args.args
         assert op_args[4] is pool
@@ -1662,8 +1669,13 @@ def test_pooled_conv_format_is_declared_without_changing_ssm_dtype(conv_dtype):
         assert attn.get_state_dtype() == (conv_dtype, torch.float32)
 
 
+@pytest.mark.parametrize(
+    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
+)
 def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
     cpu_vllm_config_context,
+    ssm_cache_dtype,
+    ssm_dtype,
 ):
     captured = []
 
@@ -1681,6 +1693,7 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
         ):
             attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
             attn._pooled_conv_state_dtype = dtype
+            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
             attn._build_pooled_gdn_op()
 
     assert len(captured) == 2
@@ -1696,5 +1709,21 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
             function(*operands)
         assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(dtype)
         assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
-            jnp.float32
+            ssm_dtype
         )
+
+
+@pytest.mark.parametrize(
+    "dtype,expected", [(torch.bfloat16, jnp.bfloat16), (torch.float32, jnp.float32)]
+)
+def test_state_dtype_conversion(dtype, expected):
+    assert gdn_attention_op._to_jax_state_dtype(dtype) == jnp.dtype(expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
+def test_state_dtype_rejects_unsupported_formats(dtype):
+    with pytest.raises(
+        ValueError,
+        match="Unsupported state dtype for TPU GDN.*expected float32 or bfloat16",
+    ):
+        gdn_attention_op._to_jax_state_dtype(dtype)

@@ -91,14 +91,13 @@ if TYPE_CHECKING:
         mamba_state_indices: torch.Tensor | None
 
 
-def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
+def _to_jax_state_dtype(dtype: torch.dtype) -> jnp.dtype:
     if dtype == torch.float32:
         return jnp.dtype(jnp.float32)
     if dtype == torch.bfloat16:
         return jnp.dtype(jnp.bfloat16)
     raise ValueError(
-        f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
-        f"{dtype}; expected float32 or bfloat16"
+        f"Unsupported state dtype for TPU GDN: {dtype}; expected float32 or bfloat16"
     )
 
 
@@ -378,7 +377,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(
         self, *args, pooled_conv_state_dtype: torch.dtype = torch.bfloat16, **kwargs
     ):
-        _to_jax_ssm_state_dtype(pooled_conv_state_dtype)
+        _to_jax_state_dtype(pooled_conv_state_dtype)
         self._pooled_conv_state_dtype = pooled_conv_state_dtype
         super().__init__(*args, **kwargs)
         self._create_conv1d()
@@ -721,8 +720,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
-        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
-        conv_state_dtype = _to_jax_ssm_state_dtype(self._pooled_conv_state_dtype)
+        recurrent_state_dtype = _to_jax_state_dtype(self.get_state_dtype()[1])
+        conv_state_dtype = _to_jax_state_dtype(self._pooled_conv_state_dtype)
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -894,7 +893,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
-        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+        recurrent_state_dtype = _to_jax_state_dtype(self.get_state_dtype()[1])
+        conv_state_dtype = _to_jax_state_dtype(self._pooled_conv_state_dtype)
 
         def wrapped_fn(
             hidden_states: jax.Array,
@@ -938,6 +938,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,
+                conv_state_dtype=conv_state_dtype,
             )
             if not block_major:
                 return result

@@ -42,8 +42,6 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
         # kernel). Kimi-K3's TP32 geometry is validated: prefix-cache hits are
         # byte-identical to misses and GSM8K scores 100/100 with and without the
         # pool.
-        "Qwen4ExpForCausalLM",
-        "Qwen4ExpForConditionalGeneration",
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
     }
