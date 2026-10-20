@@ -484,10 +484,34 @@ def _scenario(mode: str, num_chunks: int):
     return chunks, requests, kwargs, [sp.context for sp in specs], specs
 
 
+# Eagle3Proposer's @torch.compile(backend="tpu") helpers that propose() calls.
+_COMPILED_DRAFT_HELPERS = (
+    "_draft_seed_input_ids",
+    "_draft_combine_hidden_states",
+    "_draft_gather_carries",
+    "_draft_gather_rows",
+    "_draft_propose_token",
+)
+
+
+def _eager_body(method):
+    """The Python body under `_static_shape_args(torch.compile(...)(fn))`
+    (idempotent: `_run` runs twice per test)."""
+    compiled = getattr(method, "__wrapped__", method)
+    return getattr(compiled, "_torchdynamo_orig_callable", compiled)
+
+
 def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
     import torch._dynamo
 
     torch._dynamo.reset()
+    # propose() runs its small helpers in @torch.compile(backend="tpu")
+    # regions, which need a TPU device; on the CPU lane run their bodies
+    # eagerly (the TPU equality run covers the compiled path).
+    for name in _COMPILED_DRAFT_HELPERS:
+        monkeypatch.setattr(
+            e3.Eagle3Proposer, name, _eager_body(getattr(e3.Eagle3Proposer, name))
+        )
     chunks, requests, kwargs, prefix_lens, specs = _scenario(mode, num_chunks)
     world = _ToyWorld(len(specs), 24, prefix_lens)
     K = 3
