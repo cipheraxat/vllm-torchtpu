@@ -550,15 +550,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter: each rank runs o_proj on its weighted partial of every
     # group head, and o_proj's all-reduce sums the ranks. Smaller steps keep
     # the merge and the sharded o_proj. On by default; a no-op unless o_proj is
-    # per-channel FP8 from an FP8 checkpoint. Costs one o_proj per layer of HBM.
+    # per-channel FP8 from an FP8 checkpoint, and with an output gate. Costs one
+    # o_proj per layer of HBM.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=True
     ),
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS", 256
     ),
-    # Its o_proj and all-reduce run in chunks of this many tokens, pipelined
-    # (each chunk's all-reduce under the next chunk's o_proj). 0 = one chunk.
+    # Its o_proj and all-reduce run in chunks of this many tokens (a multiple
+    # of 128), pipelined: each chunk's all-reduce under the next chunk's
+    # o_proj. 0 = one chunk.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 1024
     ),

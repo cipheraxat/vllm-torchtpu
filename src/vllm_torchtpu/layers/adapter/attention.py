@@ -2552,8 +2552,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
-        """Executes complete TPU multi-head latent attention evaluation."""
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
+        """Executes complete TPU multi-head latent attention evaluation.
+
+        A large qrep step under TPU_DCP_MLA_OPROJ_ALL_REDUCE returns the
+        unmerged, quantized `weight_lse_partials` instead of the output."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
         )
@@ -2720,17 +2723,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     and getattr(layer, "W_O_dcp_qrep", None) is not None
                     and partial.shape[0] >= envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS
                 ):
-                    # Every group head, unsummed: the wrapper's o_proj
-                    # all-reduce sums the ranks (TPU_DCP_MLA_OPROJ_ALL_REDUCE).
-                    outputs = weight_lse_partials(partial, lse)
-                else:
-                    outputs = merge_lse_partials_scatter_heads(
+                    # Every group head, unsummed and quantized by token chunk:
+                    # the wrapper's o_proj all-reduce sums the ranks
+                    # (TPU_DCP_MLA_OPROJ_ALL_REDUCE).
+                    return weight_lse_partials(
                         partial,
                         lse,
-                        is_backbone=is_backbone,
-                        wire_dtype=wire_dtype,
-                        query_start_loc=attn_metadata.query_start_loc,
+                        layer.W_O_dcp_qrep.dtype,
+                        envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS
+                        or partial.shape[0],
                     )
+                outputs = merge_lse_partials_scatter_heads(
+                    partial,
+                    lse,
+                    is_backbone=is_backbone,
+                    wire_dtype=wire_dtype,
+                    query_start_loc=attn_metadata.query_start_loc,
+                )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2768,7 +2777,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         if uv_first:
-            outputs = outputs.to(input_dtype).flatten(1)
+            outputs = outputs.to(input_dtype).reshape(
+                -1, layer.num_heads * layer.v_head_dim
+            )
         else:
             outputs_t = outputs.reshape(
                 -1, layer.num_heads, layer.kv_lora_rank
