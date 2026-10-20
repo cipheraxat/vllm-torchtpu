@@ -107,11 +107,22 @@ def _fake_prequantized_matmul(
     return x_q.new_empty((x_q.shape[0], w_q.shape[1]), dtype=getattr(torch, out_dtype))
 
 
+def _after_jax(x: jax.Array, dep: jax.Array) -> jax.Array:
+    """`x`, ordered after `dep`: an edge for the scheduler, with no data."""
+    return jax.lax.optimization_barrier((x, dep))[0]
+
+
+def _fake_after(x: torch.Tensor, dep: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
 _prequantized_matmul = pallas.jax_op(
     "pallas::prequantized_matmul", xla_prequantized_matmul
 )
 _prequantized_matmul.register_fake(_fake_prequantized_matmul)
+_after = pallas.jax_op("pallas::after", _after_jax)
+_after.register_fake(_fake_after)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -1270,14 +1281,6 @@ def _index_select_bits(t: torch.Tensor, axis: int, index: torch.Tensor):
     return fresh_buffer(out.view(t.dtype))
 
 
-def _plus_zero_of(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """`x` plus a zero read from `t`, so `x` orders after `t`. A dead read
-    would be eliminated, so the zero rides on `x`, as in
-    `small_all_reduce_op.retain`."""
-    v = t[(0,) * t.ndim].to(x.dtype)
-    return x + (v - v)
-
-
 def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
     """Reorder a processed linear layer's output channels: `out'[j] = out[index[j]]`.
 
@@ -2104,17 +2107,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # Every group head, unmerged and quantized by token chunk
             # (`weight_lse_partials`): the group's o_proj, whose all-reduce also
             # sums the DCP ranks. A chunk's all-reduce overlaps the next chunk's
-            # o_proj; each all-reduce reads a zero from the one before, or XLA
-            # combines them after the last o_proj. The zero lands on one row:
-            # added to all of `y`, XLA fuses it into the dot, which would then
-            # wait for the previous all-reduce too.
+            # o_proj; each all-reduce is ordered after the one before, or XLA
+            # combines them after the last o_proj.
             w_o, s_o = w_o[rows:], s_o[n:]
             out_dtype = str(hidden_states.dtype).removeprefix("torch.")
             outs: list[torch.Tensor] = []
             for x, x_scale in attn_out:
                 y = _prequantized_matmul(x, x_scale, w_o, s_o, out_dtype)
                 if outs:
-                    y = y.slice_scatter(_plus_zero_of(y[:1], outs[-1]), 0, 0, 1)
+                    y = _after(y, outs[-1])
                 outs.append(tensor_model_parallel_all_reduce(y))
             return outs[0] if len(outs) == 1 else torch.cat(outs)
         if prefill_group is not None:
