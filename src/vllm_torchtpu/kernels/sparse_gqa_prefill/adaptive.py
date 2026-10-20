@@ -10,9 +10,6 @@ bounds selected-KV compute for large unions. Dispatch is outside both kernels;
 all metadata and branch costs belong to the end-to-end call.
 """
 
-import functools
-import math
-
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -38,7 +35,7 @@ def adaptive_prefill(
 ) -> tuple[jax.Array, jax.Array]:
     """Attend within the measured envelope; cache is returned unchanged.
 
-    The single request starts at zero. Inactive padded rows have length zero
+    Request starts include padded slots. Inactive token rows have length zero
     and group IDs -1; each active row has a unique valid prefix of selected
     complete groups. KV scales are one. Callers gate all other configurations
     with is_supported_by_adaptive_prefill before entering this function.
@@ -57,142 +54,264 @@ def adaptive_prefill(
         v_scale=1.0,
     ):
         raise NotImplementedError(
-            "Adaptive prefill requires the measured TPU7x single-request "
-            "Q24/KV2/D256, page1664, T multiple of 256 envelope; "
+            "Adaptive prefill requires the measured TPU7x "
+            "Q24/KV2/D256, page1664 envelope; "
             "use block_sparse_gqa_attention for other configurations"
         )
-    outer_chunk = math.gcd(len(q), 8192)
-    sc_chunk_size = SC_CHUNK_SIZE[jnp.dtype(cache.dtype)]
-    tc = functools.partial(
-        candidate.block_sparse_gqa_attention,
+    arrays = (q, gate, blocks, lengths, table)
+    # Preserve the one-chunk schedule at the calibrated common bucket.
+    if len(q) <= 8192 and len(q) % 256 == 0:
+        return _one_chunk(arrays, cache, starts)
+
+    full_chunks, tail = divmod(len(q), 8192)
+    num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
+    choices = None
+    if full_chunks and not tc_always_wins(
+        queries=8192, num_tiles=num_tiles, dtype=cache.dtype
+    ):
+        choices = lax.map(
+            lambda data: _choose(
+                data[1], data[2], starts, data[0] * 8192, 8192, num_tiles, cache.dtype
+            ),
+            (
+                jnp.arange(full_chunks),
+                blocks[: full_chunks * 8192].reshape(full_chunks, 8192, -1),
+                lengths[: full_chunks * 8192].reshape(full_chunks, 8192),
+            ),
+        )
+
+    # Carry only the final output. In particular, do not slice/materialize
+    # all full-chunk Q/gate inputs before the TC/SC branch, or concatenate
+    # separately allocated prefix/tail outputs. SC gathers one microchunk.
+    output = jnp.zeros_like(q)
+
+    def full(i, output):
+        choose = jnp.array(False) if choices is None else choices[i]
+        return _write_chunk(arrays, cache, starts, output, i * 8192, 8192, choose)
+
+    def remainder(output):
+        offset = full_chunks * 8192
+        padded = (tail + 255) // 256 * 256
+        ids = jnp.pad(blocks[offset:], ((0, padded - tail), (0, 0)), constant_values=-1)
+        ls = jnp.pad(lengths[offset:], (0, padded - tail))
+        choose = _choose(ids, ls, starts, offset, tail, num_tiles, cache.dtype)
+        return _write_chunk(
+            arrays, cache, starts, output, offset, tail, choose, tail=True
+        )
+
+    if full_chunks and tail:
+        # Keep the output in one loop carry, including the remainder. A separate
+        # prefix loop followed by a tail update can retain another full output
+        # workspace across the tail's branches and BF16 rounding operations.
+        def step(i, output):
+            return lax.cond(
+                i < full_chunks, lambda out: full(i, out), remainder, output
+            )
+
+        output = lax.fori_loop(0, full_chunks + 1, step, output)
+    elif full_chunks:
+        output = lax.fori_loop(0, full_chunks, full, output)
+    else:
+        output = remainder(output)
+    return output, cache
+
+
+def _direct_tc(query, gate, blocks, lengths, table, cache):
+    return candidate.block_sparse_gqa_attention(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        jnp.array([0, len(query)], jnp.int32),
         kv_heads=2,
         ratio=4,
         query_block=256,
         kv_tile=256,
+    )[0]
+
+
+def _ragged_tc_write(arrays, cache, starts, output, offset, size):
+    local = jnp.clip(starts - offset, 0, size)
+
+    def request(req, output):
+        count = (local[req + 1] - local[req] + 255) // 256
+
+        def tile(i, output):
+            first = offset + local[req] + i * 256
+            rows = min(256, len(output))
+            start = jnp.minimum(first, len(output) - rows)
+            indices = start + jnp.arange(rows, dtype=jnp.int32)
+            valid = (indices >= first) & (indices < offset + local[req + 1])
+            ys = tuple(
+                jnp.pad(
+                    jnp.where(
+                        valid.reshape((rows,) + (1,) * (x.ndim - 1)),
+                        lax.dynamic_slice_in_dim(x, start, rows),
+                        -1 if k == 2 else 0,
+                    ),
+                    ((0, 256 - rows),) + ((0, 0),) * (x.ndim - 1),
+                    constant_values=-1 if k == 2 else 0,
+                )
+                for k, x in enumerate(arrays[:4])
+            )
+            # A clipped final tile can begin before this request. All its
+            # live queries still use this request's table, including when
+            # the first query lane is masked.
+            table = jnp.broadcast_to(arrays[4][first], (256, arrays[4].shape[1]))
+            result = _direct_tc(ys[0], ys[1], ys[2], ys[3], table, cache)[:rows]
+            old = lax.dynamic_slice_in_dim(output, start, rows)
+            result = jnp.where(valid[:, None, None], result, old)
+            return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
+
+        return lax.fori_loop(0, count, tile, output)
+
+    return lax.fori_loop(0, len(starts) - 1, request, output)
+
+
+def _tc(query, gate, blocks, lengths, table, cache, starts):
+    aligned = jnp.all((starts[:-1] % 256 == 0) | (jnp.diff(starts) == 0))
+    arrays = (query, gate, blocks, lengths, table)
+    return lax.cond(
+        aligned,
+        lambda _: _direct_tc(query, gate, blocks, lengths, table, cache),
+        lambda _: _ragged_tc_write(
+            arrays, cache, starts, jnp.zeros_like(query), 0, len(query)
+        ),
+        None,
     )
-    sc = functools.partial(_sc_prefill, chunk_size=sc_chunk_size)
+
+
+def _choose(ids, lengths, starts, offset, size, num_tiles, dtype):
+    local = jnp.clip(starts - offset, 0, size)
+    aligned = jnp.all((local[:-1] % 256 == 0) | (jnp.diff(local) == 0))
+    # A boundary inside a TC tile changes the padded schedule; its fitted
+    # Q256 union costs no longer describe the actual work. Keep TC there.
+    return lax.cond(
+        aligned,
+        lambda _: select_sc(
+            ids,
+            lengths,
+            num_tiles=num_tiles,
+            dtype=dtype,
+            sc_queries=(size + SC_CHUNK_SIZE[jnp.dtype(dtype)] - 1)
+            // SC_CHUNK_SIZE[jnp.dtype(dtype)]
+            * SC_CHUNK_SIZE[jnp.dtype(dtype)],
+        ),
+        lambda _: jnp.array(False),
+        None,
+    )
+
+
+def _one_chunk(arrays, cache, starts):
+    q, gate, blocks, lengths, table = arrays
     num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
-    static_tc = tc_always_wins(
-        queries=outer_chunk, num_tiles=num_tiles, dtype=cache.dtype
-    )
+    if tc_always_wins(queries=len(q), num_tiles=num_tiles, dtype=cache.dtype):
+        return _tc(q, gate, blocks, lengths, table, cache, starts), cache
+    choose = _choose(blocks, lengths, starts, 0, len(q), num_tiles, cache.dtype)
 
-    def step(kv, xs):
-        query, gate, ids, ls, pages = xs
-        choose = select_sc(ids, ls, num_tiles=num_tiles, dtype=kv.dtype)
-        result, kv = lax.cond(
-            choose,
-            lambda args: sc(*args),
-            lambda args: tc(*args),
-            (query, gate, ids, ls, pages, kv, jnp.array([0, outer_chunk], jnp.int32)),
-        )
-        return kv, result
+    def sc(_):
+        return _sc_prefill(
+            q,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            chunk_size=SC_CHUNK_SIZE[jnp.dtype(cache.dtype)],
+        )[0]
 
-    xs = tuple(
-        x.reshape(-1, outer_chunk, *x.shape[1:])
-        for x in (q, gate, blocks, lengths, table)
-    )
+    return lax.cond(
+        choose, sc, lambda _: _tc(q, gate, blocks, lengths, table, cache, starts), None
+    ), cache
 
-    # Reuse one bounded metadata pass for both the whole-call TC fast path
-    # and individual chunks. Only one boolean per chunk stays live.
-    choices = None
-    if len(q) > outer_chunk and not static_tc:
-        choices = lax.map(
-            lambda data: select_sc(
-                data[0], data[1], num_tiles=num_tiles, dtype=cache.dtype
-            ),
-            (xs[2], xs[3]),
-        )
 
-    def run_adaptive(inputs):
-        kv, inputs = inputs
-        if len(q) == outer_chunk:
-            return lax.scan(step, kv, inputs, unroll=1)
-        full = tuple(x.reshape(-1, *x.shape[2:]) for x in inputs)
-        output = jnp.empty_like(full[0])
+def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=False):
+    def tc(output):
+        local = jnp.clip(starts - offset, 0, size)
+        aligned = jnp.all((local[:-1] % 256 == 0) | (jnp.diff(local) == 0))
 
-        def block(i, state):
-            kv, output = state
-            offset = i * outer_chunk
-            assert choices is not None
-            choose = choices[i]
-
-            def tc_block(state):
-                kv, output = state
+        def direct(output):
+            if tail:
+                padding = (-size) % 256
                 ys = tuple(
-                    lax.dynamic_slice_in_dim(x, offset, outer_chunk) for x in full
+                    jnp.pad(
+                        x[offset:],
+                        ((0, padding),) + ((0, 0),) * (x.ndim - 1),
+                        constant_values=-1 if i == 2 else 0,
+                    )
+                    for i, x in enumerate(arrays)
                 )
-                result, kv = tc(
-                    ys[0],
-                    ys[1],
-                    ys[2],
-                    ys[3],
-                    ys[4],
-                    kv,
-                    jnp.array([0, outer_chunk], jnp.int32),
-                )
-                output = lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
-                return kv, output
+            else:
+                ys = tuple(lax.dynamic_slice_in_dim(x, offset, size) for x in arrays)
+            result = _direct_tc(ys[0], ys[1], ys[2], ys[3], ys[4], cache)[:size]
+            return lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
 
-            def sc_block(state):
-                def micro(j, state):
-                    kv, output = state
-                    start = offset + j * sc_chunk_size
-                    ys = tuple(
-                        lax.dynamic_slice_in_dim(x, start, sc_chunk_size) for x in full
-                    )
-                    result, kv = sc_grouped_attention(
-                        ys[0],
-                        ys[1],
-                        ys[2],
-                        ys[3],
-                        ys[4],
-                        kv,
-                        kv_heads=2,
-                        ratio=4,
-                        query_group=8,
-                        tile_k=256,
-                    )
-                    output = lax.dynamic_update_slice_in_dim(
-                        output, result, start, axis=0
-                    )
-                    return kv, output
+        # Align only one request-local Q256 tile directly into the final
+        # output. Do not retain full-chunk Q/gate copies and a separate
+        # full-chunk ragged output across the request loop.
+        return lax.cond(
+            aligned,
+            direct,
+            lambda out: _ragged_tc_write(arrays, cache, starts, out, offset, size),
+            output,
+        )
 
-                return lax.fori_loop(0, outer_chunk // sc_chunk_size, micro, state)
+    def sc(output):
+        chunk = SC_CHUNK_SIZE[jnp.dtype(cache.dtype)]
 
-            return lax.cond(choose, sc_block, tc_block, (kv, output))
-
-        kv, output = lax.fori_loop(0, len(q) // outer_chunk, block, (kv, output))
-        return kv, output.reshape(-1, outer_chunk, *q.shape[1:])
-
-    def run_tc(inputs):
-        kv, inputs = inputs
-
-        def tc_step(kv, ys):
-            result, kv = tc(
+        def micro(i, output):
+            start = offset + i * chunk
+            ys = tuple(lax.dynamic_slice_in_dim(x, start, chunk) for x in arrays)
+            result, _ = sc_grouped_attention(
                 ys[0],
                 ys[1],
                 ys[2],
                 ys[3],
                 ys[4],
-                kv,
-                jnp.array([0, outer_chunk], jnp.int32),
+                cache,
+                kv_heads=2,
+                ratio=4,
+                query_group=8,
+                tile_k=256,
             )
-            return kv, result
+            return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
 
-        return lax.scan(tc_step, kv, inputs, unroll=1)
+        if size // chunk:
+            output = lax.fori_loop(0, size // chunk, micro, output)
+        if tail and size % chunk:
+            live = size % chunk
+            start = offset + size - live
+            ys = tuple(
+                jnp.pad(
+                    x[start:],
+                    ((0, chunk - live),) + ((0, 0),) * (x.ndim - 1),
+                    constant_values=-1 if i == 2 else 0,
+                )
+                for i, x in enumerate(arrays)
+            )
+            result, _ = sc_grouped_attention(
+                ys[0],
+                ys[1],
+                ys[2],
+                ys[3],
+                ys[4],
+                cache,
+                kv_heads=2,
+                ratio=4,
+                query_group=8,
+                tile_k=256,
+            )
+            output = lax.dynamic_update_slice_in_dim(
+                output, result[:live], start, axis=0
+            )
+        return output
 
-    if static_tc:
-        cache, out = run_tc((cache, xs))
-    elif len(q) == outer_chunk:
-        cache, out = run_adaptive((cache, xs))
-    else:
-        assert choices is not None
-        possible = jnp.any(choices)
-        cache, out = lax.cond(possible, run_adaptive, run_tc, (cache, xs))
-    return out.reshape(q.shape), cache
+    return lax.cond(choose, sc, tc, output)
 
 
-def _sc_prefill(q, gate, blocks, lengths, table, cache, starts, *, chunk_size):
+def _sc_prefill(q, gate, blocks, lengths, table, cache, *, chunk_size):
     def step(kv, inputs):
         out, kv = sc_grouped_attention(
             inputs[0],
@@ -238,14 +357,14 @@ def is_supported_by_adaptive_prefill(
     if (
         query.ndim != 3
         or query.shape[1:] != (24, 256)
-        or not 256 <= query.shape[0] <= 262144
-        or query.shape[0] % 256
+        or not 1 <= query.shape[0] <= 262144
         or gate.shape != query.shape
         or query.dtype != jnp.bfloat16
         or gate.dtype != jnp.bfloat16
         or kv_heads != 2
         or ratio != 4
-        or starts.shape != (2,)
+        or starts.ndim != 1
+        or starts.shape[0] < 2
         or cache.ndim != 5
         or cache.shape[0] == 0
         or cache.shape[1] != 1664

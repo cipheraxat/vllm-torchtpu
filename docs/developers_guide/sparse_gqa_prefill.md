@@ -10,26 +10,49 @@ adding the standalone kernel does not change any model's default path.
 The calibrated schedule is limited to TPU7x with SparseCore and the pinned
 JAX/JAXLIB 0.11.2 and libtpu 0.0.50. Query and gate are BF16 `[T, 24, 256]`,
 with two KV heads, compression ratio four, and 512 selected groups per query.
-T is a positive multiple of 256, at most 262144.
+T is positive and at most 262144; a final partial tile is masked.
 
-The native cache has 1664-token pages and BF16 or FP8 E4M3FN packing. The
-cache tensor must fit within 16 GiB; the page table has at most 158 columns.
-K/V scales must be statically known Python scalars equal to one.
+The native cache uses BF16 or FP8 E4M3FN packing with int32 metadata. The
+wrapper passes unit K/V scales to both branches, so nonunit or dynamic scales
+must retain the general TC path.
 
-One request slot is supported (`starts.shape == (2,)`, starting at zero).
+Page size 1664, context/query count 262144, and the 16 GiB pool guard describe
+the validated calibration envelope. The table endpoint is
+`ceil(262144 / 1664) = 158` columns, derived from that context endpoint, rather
+than an addressing limit. The lookup supports padded 128-column chunks;
+changing page/context geometry changes its work and has not been calibrated
+here. Physical row addresses must fit int32, but the 16 GiB guard is stricter
+than that implementation constraint and is not a hardware capacity claim.
+Q24/KV2/D256 and ratio four likewise scope this fitted selector, not general
+SC support across local head layouts. Broader SC calibration is separate work;
+other configurations retain TC. The paired TC policy has no D256 upper bound:
+its dimension alignment and working-set checks determine eligibility.
+
+Request starts are nondecreasing, starting at zero, and include padded slots.
 Active rows have `min(length // 4, 512)` unique valid complete groups in a
 prefix, followed by -1 IDs, plus the implicit partial tail. Inactive rows
 have zero length and -1 IDs. Their output is zero even if their query or
 gate contains NaN. The kernel returns the cache unchanged.
 
 `is_supported_by_adaptive_prefill` checks static eligibility. Callers must
-provide valid runtime metadata. Padded multi-slot metadata falls back even
-when only one request is active. Large shared serving pools may also exceed
+provide valid runtime metadata. Padded slots have repeated starts and do not
+prevent optimized routing.
+Boundaries inside a Q256 tile retain request-aware TC alignment because the
+calibrated union costs do not include that padding. Large shared pools may exceed
 the cache bound. Kernel benchmarks do not establish model-serving coverage.
+
+The paired TC tile policy is separate: it derives eligibility from local Q/KV
+heads, GQA divisibility, dimension, native packing, 128-token page segments,
+hardware and a working-set bound relative to the measured tile. It does not
+assume a tensor-parallel degree or use token buckets as layout constraints.
+Other valid geometry retains the general one-selection-word TC path. This
+resource bound is not a latency prediction for unmeasured head layouts.
 
 ## Dispatch and memory
 
-Outer chunks contain `gcd(T, 8192)` queries. The cost model estimates TC work
+Outer chunks contain 8192 queries followed by a bounded remainder. Only the
+last TC tile or SC microchunk is padded; full inputs and selected KV are never
+padded to a context-sized buffer. The cost model estimates TC work
 from Q256/KV256 tile unions and SC work from scheduled queries and Q8/KV256
 attention tiles. Coefficients are specific to the supported device and
 geometry; they are not universal hardware constants.
@@ -47,6 +70,21 @@ the supported top-k. Grouped attention keeps each query's softmax independent.
 FP32 accumulation and BF16 output/gate rounding retain the existing QSA
 arithmetic boundaries. Multi-chunk calls write into the final output and
 reuse scratch. Compiler temporary memory is tested separately from total HBM.
+The 400 MiB mixed-output check is an empirical regression target, not a device
+capacity or measured runtime peak. The full-context compile-only check compares
+16384 and 262144 queries at fixed cache geometry: additional scratch must fit
+within the increase in source-shaped selection metadata. This detects a new
+whole-query/gate workspace without choosing another absolute compiler budget.
+The earlier 640 MiB assertion is tracked in review measurements, including any
+regression against its unchanged parent. Neither check establishes latency or
+peak-HBM guarantees. Ragged TC tiles write directly into the final output,
+avoiding a full-chunk alignment/scatter workspace. Selected-KV scratch is bounded
+by the microchunk, independently of unused physical cache pages.
+
+Returning an unchanged cache from a standalone, non-donating JIT can still
+materialize an observable returned array. Output-only callers eliminate that
+return. The pooled serving custom op already donates its mutable pool; this
+kernel does not introduce donation or change cache ownership.
 
 ## Reproduction
 

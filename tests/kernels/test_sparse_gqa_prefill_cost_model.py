@@ -89,3 +89,21 @@ def test_exact_bitmap_counts_a_distant_partial_tail():
         exact_counts(ids, jnp.zeros_like(lengths), num_tiles=1027),
         [0],
     )
+
+
+def test_tail_cost_uses_sc_microchunk_instead_of_tc_padding():
+    rng = np.random.default_rng(2018)
+    blocks = np.full((256, 512), -1, np.int32)
+    for row in range(17):
+        blocks[row] = rng.choice(8192, 512, replace=False)
+    lengths = np.zeros(256, np.int32)
+    lengths[:17] = 262144
+    route = jax.jit(functools.partial(select_sc, num_tiles=1027, dtype=jnp.bfloat16))
+    # The same visibility and coefficients, but TC schedules Q256 whereas
+    # this tail gathers only one SC32 microchunk. Inactive rows still cost
+    # transport up to that microchunk, not all the way to TC's Q256 tile.
+    assert not bool(route(jnp.asarray(blocks), jnp.asarray(lengths)))
+    short = jax.jit(
+        functools.partial(select_sc, num_tiles=1027, dtype=jnp.bfloat16, sc_queries=32)
+    )
+    assert bool(short(jnp.asarray(blocks), jnp.asarray(lengths)))

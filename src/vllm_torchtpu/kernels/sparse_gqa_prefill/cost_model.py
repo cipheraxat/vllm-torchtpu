@@ -53,7 +53,9 @@ COST_MODELS: dict[jnp.dtype, PrefillCostModel] = {
 }
 
 
-def tc_always_wins(*, queries: int, num_tiles: int, dtype: jnp.dtype) -> bool:
+def tc_always_wins(
+    *, queries: int, num_tiles: int, dtype: jnp.dtype, sc_queries: int | None = None
+) -> bool:
     """Prove TC wins even against the minimum scheduled SparseCore work."""
     model = COST_MODELS[jnp.dtype(dtype)]
     words = ((2 * num_tiles + 127) // 128) * 128
@@ -63,10 +65,11 @@ def tc_always_wins(*, queries: int, num_tiles: int, dtype: jnp.dtype) -> bool:
         + model.tc_mask_word_ms * queries * words
         + model.tc_tile_ms * (queries // 256) * num_tiles
     )
+    scheduled_sc = queries if sc_queries is None else sc_queries
     lower_sc = (
         model.sc_fixed_ms
-        + model.sc_query_ms * queries
-        + model.sc_attention_tile_ms * (queries // 8)
+        + model.sc_query_ms * scheduled_sc
+        + model.sc_attention_tile_ms * (scheduled_sc // 8)
     )
     return upper_tc <= lower_sc * 1.02
 
@@ -96,13 +99,21 @@ def sc_cost(model: PrefillCostModel, lengths: jax.Array) -> jax.Array:
 
 
 def tc_upper_bound_wins(
-    blocks: jax.Array, lengths: jax.Array, *, num_tiles: int, dtype: jnp.dtype
+    blocks: jax.Array,
+    lengths: jax.Array,
+    *,
+    num_tiles: int,
+    dtype: jnp.dtype,
+    sc_queries: int | None = None,
 ) -> jax.Array:
     """Prove the TC work estimate wins using all rows, never sampled rows."""
-    if tc_always_wins(queries=lengths.size, num_tiles=num_tiles, dtype=dtype):
+    if tc_always_wins(
+        queries=lengths.size, num_tiles=num_tiles, dtype=dtype, sc_queries=sc_queries
+    ):
         return jnp.array(True)
     model = COST_MODELS[jnp.dtype(dtype)]
-    target = sc_cost(model, lengths) * 1.02
+    # TC pads to Q256, whereas SC pads only to its gather microchunk.
+    target = sc_cost(model, lengths[:sc_queries]) * 1.02
 
     def estimate(visits):
         return tc_cost(
@@ -121,14 +132,22 @@ def tc_upper_bound_wins(
 
 
 def select_sc(
-    blocks: jax.Array, lengths: jax.Array, *, num_tiles: int, dtype: jnp.dtype
+    blocks: jax.Array,
+    lengths: jax.Array,
+    *,
+    num_tiles: int,
+    dtype: jnp.dtype,
+    sc_queries: int | None = None,
 ) -> jax.Array:
-    if tc_always_wins(queries=lengths.size, num_tiles=num_tiles, dtype=dtype):
+    if tc_always_wins(
+        queries=lengths.size, num_tiles=num_tiles, dtype=dtype, sc_queries=sc_queries
+    ):
         return jnp.array(False)
     model = COST_MODELS[jnp.dtype(dtype)]
     # A 2% reserve favors TC near the modeled crossover; no claim of a
     # universal latency bound is made by this fitted model.
-    target = sc_cost(model, lengths) * 1.02
+    # TC pads to Q256, whereas SC pads only to its gather microchunk.
+    target = sc_cost(model, lengths[:sc_queries]) * 1.02
 
     def estimate(visits):
         return tc_cost(
@@ -156,7 +175,9 @@ def select_sc(
         )
 
     return lax.cond(
-        tc_upper_bound_wins(blocks, lengths, num_tiles=num_tiles, dtype=dtype),
+        tc_upper_bound_wins(
+            blocks, lengths, num_tiles=num_tiles, dtype=dtype, sc_queries=sc_queries
+        ),
         lambda _: jnp.array(False),
         unresolved,
         None,

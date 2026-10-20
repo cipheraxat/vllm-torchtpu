@@ -3,6 +3,7 @@
 
 import functools
 import math
+import re
 
 import jax
 import jax.numpy as jnp
@@ -80,10 +81,9 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
         kwargs["v_scale"] = 2.0
     if case == "dynamic_scale":
         kwargs["k_scale"] = jax.ShapeDtypeStruct((), jnp.float32)
-    assert is_supported_by_adaptive_prefill(*args, **kwargs) == (case == "supported")
-    if case == "ragged":
-        with pytest.raises(NotImplementedError, match="measured TPU7x"):
-            adaptive_prefill(*args)
+    assert is_supported_by_adaptive_prefill(*args, **kwargs) == (
+        case in ("supported", "ragged")
+    )
 
 
 def _make_inputs(tokens, context, fp8, sc_first):
@@ -135,14 +135,16 @@ def _make_inputs(tokens, context, fp8, sc_first):
         (512, 8192, False),
         (512, 262144, True),
         (12288, 262144, True),
+        (8448, 262144, True),
         (8192, 8192, False),
         (8192, 262144, True),
         (16384, 131072, False),
         (16384, 131072, True),
+        (16640, 131072, True),
     ],
 )
 def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
-    tokens, context, sc_first, fp8
+    tokens, context, sc_first, fp8, record_property
 ):
     if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
         pytest.skip("Adaptive SparseCore schedule is measured on TPU7x")
@@ -151,9 +153,12 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
     compiled = jax.jit(adaptive_prefill).lower(*args).compile()
     hlo = compiled.as_text()
     assert ("sc_compact_grouped_prefill" in hlo) == (context > 8192)
-    # Old SC256 needs >= 584 MiB even for FP8. This also catches output-carry
-    # regressions that restore full intermediate buffers for mixed chunks.
-    assert compiled.memory_analysis().temp_size_in_bytes < 400 * 1024**2
+    # Empirical compiler-plan regression budget, not a device capacity or
+    # measured runtime peak. Keep the original mixed-output budget; unused
+    # physical capacity is checked separately with fixed logical inputs.
+    temporary = compiled.memory_analysis().temp_size_in_bytes
+    record_property("compiler_temporary_bytes", temporary)
+    assert temporary < 400 * 1024**2
     output, returned = compiled(*args)
     baseline, _ = jax.jit(
         functools.partial(
@@ -172,18 +177,20 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
         np.asarray(returned).view(np.uint8), cache.view(np.uint8)
     )
     if tokens > 8192:
-        chunk = math.gcd(tokens, 8192)
-        choices = jax.jit(
-            jax.vmap(
-                functools.partial(
-                    select_sc,
-                    num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
-                    dtype=args[5].dtype,
-                )
+        choices = [
+            bool(
+                jax.jit(
+                    functools.partial(
+                        select_sc,
+                        num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
+                        dtype=args[5].dtype,
+                    )
+                )(args[2][i : i + 8192], args[3][i : i + 8192])
             )
-        )(args[2].reshape(-1, chunk, 512), args[3].reshape(-1, chunk))
+            for i in range(0, tokens, 8192)
+        ]
         np.testing.assert_array_equal(
-            choices, [(i < 8192) == sc_first for i in range(0, tokens, chunk)]
+            choices, [(i < 8192) == sc_first for i in range(0, tokens, 8192)]
         )
     # FP64 independent reference includes partial groups and physical page tails.
     for row in (1, 32, min(8190, tokens - 2), tokens - 2):
@@ -216,8 +223,8 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
         (512, True),
         (12288, True),
         (262144, True),
-        (128, False),
-        (257, False),
+        (128, True),
+        (257, True),
         (262400, False),
     ],
 )
@@ -240,13 +247,51 @@ def test_query_bucket_envelope(monkeypatch, tokens, supported):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-def test_full_256k_dispatch_keeps_compiler_temporary_memory_bounded(fp8):
+def test_full_256k_compiler_workspace_growth_is_bounded_by_metadata(
+    fp8, record_property
+):
     if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
         pytest.skip("Adaptive SparseCore schedule is measured on TPU7x")
+    temporary, metadata = [], []
+    for tokens in (16384, 262144):
+        args = _abstract_args(jnp.float8_e4m3fn if fp8 else jnp.bfloat16)
+        for i in range(5):
+            args[i] = jax.ShapeDtypeStruct((tokens, *args[i].shape[1:]), args[i].dtype)
+        compiled = jax.jit(adaptive_prefill, donate_argnums=(5,)).lower(*args).compile()
+        temporary.append(compiled.memory_analysis().temp_size_in_bytes)
+        metadata.append(sum(x.size * np.dtype(x.dtype).itemsize for x in args[2:5]))
+        record_property(f"compiler_temporary_bytes_{tokens}", temporary[-1])
+    # Query/selected-KV workspaces stay chunk-local. Increasing the token
+    # bucket may add source-shaped selection metadata, but must not add a
+    # whole query/gate matrix or context-sized selected-KV workspace. The
+    # cache geometry and donation match in both compilations. No inference
+    # or measured runtime peak is implied by this compiler-plan regression.
+    assert temporary[1] - temporary[0] <= metadata[1] - metadata[0]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_output_only_attention_does_not_copy_unused_physical_cache(
+    fp8, record_property
+):
     args = _abstract_args(jnp.float8_e4m3fn if fp8 else jnp.bfloat16)
     for i in range(5):
-        args[i] = jax.ShapeDtypeStruct((262144, *args[i].shape[1:]), args[i].dtype)
-    compiled = jax.jit(adaptive_prefill, donate_argnums=(5,)).lower(*args).compile()
-    # The old bounded schedule uses ~615 MiB. Recomputing choices inside the
-    # attention loop regressed to ~772 MiB despite passing the 128K check.
-    assert compiled.memory_analysis().temp_size_in_bytes < 640 * 1024**2
+        shape = (8448, 79) if i == 4 else (8448, *args[i].shape[1:])
+        args[i] = jax.ShapeDtypeStruct(shape, args[i].dtype)
+    for capacity in (79, 463):
+        args[5] = jax.ShapeDtypeStruct((capacity, *args[5].shape[1:]), args[5].dtype)
+        compiled = jax.jit(lambda *xs: adaptive_prefill(*xs)[0]).lower(*args).compile()
+        record_property(
+            f"compiler_temporary_bytes_{capacity}_pages",
+            compiled.memory_analysis().temp_size_in_bytes,
+        )
+        # Allocation/layout choices can change a little with physical capacity.
+        # Test the unwanted whole-cache copy itself, not exact scratch bytes.
+        # Synchronized capacity sweeps and device traces validate execution.
+        dtype = "f8e4m3fn" if fp8 else "bf16"
+        for line in compiled.as_text().splitlines():
+            if not re.search(r"\bcopy(?:-start|-done)?\(", line):
+                continue
+            result = line.split("=", 1)[1].split(" copy", 1)[0]
+            for shape in re.findall(rf"{dtype}\[([0-9,]+)\]", result):
+                assert math.prod(map(int, shape.split(","))) < args[5].size

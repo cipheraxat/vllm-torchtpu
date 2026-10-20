@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-rank TC geometry and native packed KV layouts."""
+"""Per-rank TC geometry and request-aware bounded adaptive tails."""
 
 import functools
 import math
@@ -14,6 +14,7 @@ from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,
 )
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import get_sparse_prefill_tiles
+from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import adaptive_prefill
 
 
 @pytest.mark.parametrize("tokens", [17, 256, 512, 4096, 8192, 8448, 16640])
@@ -190,6 +191,30 @@ def test_general_paired_geometry(tokens, heads, kv_heads, dim, fp8):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "tokens,ragged,fp8",
+    [(17, False, False), (257, False, True), (512, True, False), (512, True, True)],
+)
+def test_adaptive_short_tail_and_padded_request_boundaries(tokens, ragged, fp8):
+    args, _ = inputs(tokens, 24, 2, 256, fp8, ragged=ragged)
+    before = [np.asarray(x).copy() for x in args]
+    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    assert "prefill_paired_pages" in compiled.as_text()
+    out, returned = compiled(*args)
+    rows = [0, tokens - 2] + ([128, 129, 384, 385] if ragged else [])
+    check_reference(args, out, kv_heads=2, rows=rows)
+    again, _ = compiled(*args)
+    np.testing.assert_array_equal(again, out)
+    for x, old in zip(args, before):
+        np.testing.assert_array_equal(
+            np.asarray(x).copy().view(np.uint8), old.view(np.uint8)
+        )
+    np.testing.assert_array_equal(
+        np.asarray(returned).copy().view(np.uint8), before[5].view(np.uint8)
+    )
+
+
+@pytest.mark.tpu_test
 def test_other_compression_ratio_uses_general_tc():
     args, _ = inputs(256, 8, 4, 256, False)
     args = list(args)
@@ -218,4 +243,95 @@ def test_other_compression_ratio_uses_general_tc():
     output, _ = compiled(*args)
     check_reference(
         args, output, kv_heads=4, rows=[0, 128, 254], ratio=8, page_size=128
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8):
+    from tests.kernels.test_sparse_gqa_adaptive_prefill import _make_inputs
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+
+    args = list(_make_inputs(512, 131072, fp8, True))
+    # Distinct request page permutations in one shared pool. An unused NaN
+    # page must not enter either request's gather or the implicit partial tail.
+    args[4] = args[4].at[256:].set(args[4][256:, ::-1])
+    # Reversing the mapping makes the old logical tail reachable. Initialize
+    # those rows as valid data before poisoning a wholly unreferenced page.
+    args[5] = jnp.concatenate(
+        (jnp.nan_to_num(args[5]), jnp.full_like(args[5][:1], jnp.nan))
+    )
+    args[6] = jnp.array([0, 256, 512, 512, 512], jnp.int32)
+    choose = jax.jit(
+        functools.partial(
+            select_sc,
+            num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
+            dtype=args[5].dtype,
+        )
+    )
+    assert bool(choose(args[2], args[3]))
+    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    before = [np.asarray(x).copy() for x in args]
+    output, returned = compiled(*args)
+    check_reference(args, output, kv_heads=2, rows=[1, 255, 256, 510])
+    np.testing.assert_array_equal(compiled(*args)[0], output)
+    for x, old in zip(args, before):
+        np.testing.assert_array_equal(
+            np.asarray(x).copy().view(np.uint8), old.view(np.uint8)
+        )
+    np.testing.assert_array_equal(
+        np.asarray(returned).copy().view(np.uint8), before[5].view(np.uint8)
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_live_tail_smaller_than_sc_microchunk(fp8):
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import SC_CHUNK_SIZE
+
+    args, _ = inputs(17, 24, 2, 256, fp8)
+    args = list(args)
+    rng = np.random.default_rng(2018)
+    lengths = np.arange(131072 - 16, 131073, dtype=np.int32)
+    lengths[-1] = 0
+    blocks = np.full((17, 512), -1, np.int32)
+    for row in range(16):
+        blocks[row] = rng.choice(lengths[row] // 4, 512, replace=False)
+    pages = math.ceil(131072 / 1664)
+    args[2] = jnp.asarray(blocks)
+    args[3] = jnp.asarray(lengths)
+    args[4] = jnp.broadcast_to(
+        jnp.asarray(rng.permutation(pages), jnp.int32), (17, pages)
+    )
+    args[5] = jax.jit(
+        lambda key: jax.random.normal(key, (pages, *args[5].shape[1:])).astype(
+            args[5].dtype
+        )
+    )(jax.random.key(391))
+    choose = jax.jit(
+        functools.partial(
+            select_sc,
+            num_tiles=math.ceil(pages * 1664 / 256),
+            dtype=args[5].dtype,
+            sc_queries=SC_CHUNK_SIZE[jnp.dtype(args[5].dtype)],
+        )
+    )
+    assert bool(
+        choose(
+            jnp.pad(args[2], ((0, 239), (0, 0)), constant_values=-1),
+            jnp.pad(args[3], (0, 239)),
+        )
+    )
+    before = [np.asarray(x).copy() for x in args]
+    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    output, returned = compiled(*args)
+    check_reference(args, output, kv_heads=2, rows=[0, 15])
+    np.testing.assert_array_equal(compiled(*args)[0], output)
+    for x, old in zip(args, before):
+        np.testing.assert_array_equal(
+            np.asarray(x).copy().view(np.uint8), old.view(np.uint8)
+        )
+    np.testing.assert_array_equal(
+        np.asarray(returned).copy().view(np.uint8), before[5].view(np.uint8)
     )
