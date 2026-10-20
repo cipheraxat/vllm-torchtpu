@@ -1187,7 +1187,9 @@ def streamindex_topk(
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
 
-      components: Optional static key reader and schedule. None retains the
+      components: Optional static key reader and schedule for HEAD_ALONG_SUBLANE.
+        Composed schedules always use the scoring path, even with early exit enabled.
+        None retains the
         original packed-key reader and metadata traversal.
       topk_backend: Static selector for the score-bit buffers. The default keeps
         SparseCore selection and chunk overlap. A backend without overlap uses
@@ -1269,6 +1271,10 @@ def streamindex_topk(
     if components is not None:
         components.keys.validate(cache_kv, head_dim, kv_layout)
         components.schedule.validate(compression_ratio)
+        if kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+            raise NotImplementedError(
+                "StreamIndex components require HEAD_ALONG_SUBLANE layout."
+            )
 
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
@@ -1672,8 +1678,6 @@ def streamindex_topk(
         q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
         q_start = cu_q_lens[seq_idx]
         q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
-        if components is not None:
-            q_abs_pos = components.schedule.positions(q_abs_pos)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
             q_abs_pos // compression_ratio,
@@ -1682,7 +1686,9 @@ def streamindex_topk(
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
-    if not enable_early_exit:
+    # A custom schedule can change both visibility and DMA coverage. Its
+    # protocol does not promise equivalence to score-free prefix enumeration.
+    if not enable_early_exit or components is not None:
         return _common_path(None)
     return jax.lax.cond(
         jnp.max(seq_lens) // compression_ratio <= k,
