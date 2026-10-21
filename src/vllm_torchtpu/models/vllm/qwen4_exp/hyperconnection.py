@@ -33,39 +33,58 @@ class GatedResidual(common_hc.GatedResidual):
         self,
         *args,
         prefill_full_tile: int = 0,
+        prefill_combine_tile: int | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         if prefill_full_tile and (prefill_full_tile < 128 or prefill_full_tile % 128):
             raise ValueError("HC prefill full mix tile must be a multiple of 128")
+        if prefill_combine_tile is None:
+            prefill_combine_tile = prefill_full_tile
+        if prefill_combine_tile < 0:
+            raise ValueError("HC residual tile must be nonnegative")
         self.prefill_full_tile = prefill_full_tile
+        self.prefill_combine_tile = prefill_combine_tile
         self._prefill_full_op = None
         self._prefill_combine_op = None
-        if (
-            prefill_full_tile
-            and self.hidden_size % 128 == 0
-            and hasattr(self, "block_inject_weight")
-        ):
-            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
-                build_gated_residual_op,
-            )
+        if not (prefill_full_tile or prefill_combine_tile):
+            return
+        from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
+            supports_full_mix,
+            supports_residual,
+        )
+        from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+            build_full_mix_op,
+            build_gated_residual_op,
+            current_hc_hardware,
+        )
 
+        # Worker initialization owns the device. Unknown layout/resources keep
+        # the existing Torch path; CPU construction never initializes a TPU.
+        hardware = current_hc_hardware()
+        if hasattr(self, "block_inject_weight") and supports_residual(
+            self.hc_count, self.hidden_size, prefill_combine_tile, hardware
+        ):
             self._prefill_combine_op = build_gated_residual_op(
-                self.hc_count, self.hidden_size, prefill_full_tile
+                self.hc_count, self.hidden_size, prefill_combine_tile, hardware
             )
         if (
-            prefill_full_tile
-            and self.hidden_size % 128 == 0
-            and self.config.hc_per_branch_norm
+            self.config.hc_per_branch_norm
             and hasattr(self, "input_mix_weight_down")
+            and supports_full_mix(
+                self.hc_count,
+                self.hidden_size,
+                self.input_mix_weight_down.weight.shape[0],
+                prefill_full_tile,
+                hardware,
+            )
         ):
-            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_full_mix_op
-
             self._prefill_full_op = build_full_mix_op(
                 self.hc_count,
                 self.hidden_size,
                 self.hc_norm.variance_epsilon,
                 prefill_full_tile,
+                hardware,
             )
 
     def _normalize(self, hyper_input):
@@ -92,8 +111,8 @@ class GatedResidual(common_hc.GatedResidual):
             raise RuntimeError("mix was disabled for this hyper-connection")
         if (
             self._prefill_full_op is not None
-            and hyper_input.shape[0] >= 2 * self.prefill_full_tile
-            and hyper_input.shape[0] % (2 * self.prefill_full_tile) == 0
+            and hyper_input.shape[0] >= self.prefill_full_tile
+            and hyper_input.shape[0] % self.prefill_full_tile == 0
             and hyper_input.dtype == torch.bfloat16
             and self.hc_norm.weight.dtype == torch.bfloat16
             and self.input_mix_weight_down.weight.dtype == torch.bfloat16
@@ -136,8 +155,8 @@ class GatedResidual(common_hc.GatedResidual):
         injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
         if (
             self._prefill_combine_op is not None
-            and hyper_input.shape[0] >= 2 * self.prefill_full_tile
-            and hyper_input.shape[0] % (2 * self.prefill_full_tile) == 0
+            and hyper_input.shape[0] >= self.prefill_combine_tile
+            and hyper_input.shape[0] % self.prefill_combine_tile == 0
             and hyper_input.dtype == torch.bfloat16
             and block_output.dtype == torch.bfloat16
         ):
