@@ -15,6 +15,9 @@
 
 import jax.numpy as jnp
 
+# Validated number of query rows per outer dispatch chunk.
+PREFILL_DISPATCH_CHUNK_QUERIES = 8192
+
 # Both native dtypes use a 144 MiB compact selected-KV buffer.
 SC_CHUNK_SIZE = {jnp.dtype(jnp.bfloat16): 32, jnp.dtype(jnp.float8_e4m3fn): 64}
 

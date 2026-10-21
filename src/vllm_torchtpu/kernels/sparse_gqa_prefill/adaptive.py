@@ -33,7 +33,10 @@ from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import (
     select_sc,
     tc_selected_by_static_bound,
 )
-from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import SC_CHUNK_SIZE
+from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
+    PREFILL_DISPATCH_CHUNK_QUERIES,
+    SC_CHUNK_SIZE,
+)
 
 
 def adaptive_prefill(
@@ -72,37 +75,14 @@ def adaptive_prefill(
         )
     arrays = (q, gate, blocks, lengths, table)
     # Preserve the one-chunk schedule at the calibrated common bucket.
-    if len(q) <= 8192 and len(q) % 256 == 0:
+    if len(q) <= PREFILL_DISPATCH_CHUNK_QUERIES and len(q) % 256 == 0:
         return _one_chunk(arrays, cache, starts)
 
-    full_chunks, tail = divmod(len(q), 8192)
+    full_chunks, tail = divmod(len(q), PREFILL_DISPATCH_CHUNK_QUERIES)
     num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
-    choices = None
-    if full_chunks and not tc_selected_by_static_bound(
-        queries=8192, num_tiles=num_tiles, dtype=cache.dtype
-    ):
-
-        def select_chunk(data):
-            chunk_index, chunk_blocks, chunk_lengths = data
-            return _select_sc_for_chunk(
-                chunk_blocks,
-                chunk_lengths,
-                starts,
-                chunk_index * 8192,
-                8192,
-                num_tiles,
-                cache.dtype,
-            )
-
-        choices = lax.map(
-            select_chunk,
-            (
-                jnp.arange(full_chunks),
-                blocks[: full_chunks * 8192].reshape(full_chunks, 8192, -1),
-                lengths[: full_chunks * 8192].reshape(full_chunks, 8192),
-            ),
-        )
-
+    choices = _select_sc_for_full_chunks(
+        blocks, lengths, starts, cache, full_chunks, num_tiles
+    )
     # Carry only the final output. In particular, do not slice/materialize
     # all full-chunk Q/gate inputs before the TC/SC branch, or concatenate
     # separately allocated prefix/tail outputs. SC gathers one microchunk.
@@ -110,15 +90,20 @@ def adaptive_prefill(
 
     def full(i, output):
         choose = jnp.array(False) if choices is None else choices[i]
-        return _write_chunk(arrays, cache, starts, output, i * 8192, 8192, choose)
+        return _write_chunk(
+            arrays,
+            cache,
+            starts,
+            output,
+            i * PREFILL_DISPATCH_CHUNK_QUERIES,
+            PREFILL_DISPATCH_CHUNK_QUERIES,
+            choose,
+        )
 
     def remainder(output):
-        offset = full_chunks * 8192
-        padded = (tail + 255) // 256 * 256
-        ids = jnp.pad(blocks[offset:], ((0, padded - tail), (0, 0)), constant_values=-1)
-        ls = jnp.pad(lengths[offset:], (0, padded - tail))
-        choose = _select_sc_for_chunk(
-            ids, ls, starts, offset, tail, num_tiles, cache.dtype
+        offset = full_chunks * PREFILL_DISPATCH_CHUNK_QUERIES
+        choose = _select_sc_for_tail(
+            blocks, lengths, starts, cache, offset, tail, num_tiles
         )
         return _write_chunk(
             arrays, cache, starts, output, offset, tail, choose, tail=True
@@ -139,6 +124,49 @@ def adaptive_prefill(
     else:
         output = remainder(output)
     return output, cache
+
+
+def _select_sc_for_full_chunks(blocks, lengths, starts, cache, full_chunks, num_tiles):
+    """Select full outer chunks without materializing query or gate chunks."""
+    choices = None
+    if full_chunks and not tc_selected_by_static_bound(
+        queries=PREFILL_DISPATCH_CHUNK_QUERIES, num_tiles=num_tiles, dtype=cache.dtype
+    ):
+
+        def select_chunk(data):
+            chunk_index, chunk_blocks, chunk_lengths = data
+            return _select_sc_for_chunk(
+                chunk_blocks,
+                chunk_lengths,
+                starts,
+                chunk_index * PREFILL_DISPATCH_CHUNK_QUERIES,
+                PREFILL_DISPATCH_CHUNK_QUERIES,
+                num_tiles,
+                cache.dtype,
+            )
+
+        choices = lax.map(
+            select_chunk,
+            (
+                jnp.arange(full_chunks),
+                blocks[: full_chunks * PREFILL_DISPATCH_CHUNK_QUERIES].reshape(
+                    full_chunks, PREFILL_DISPATCH_CHUNK_QUERIES, -1
+                ),
+                lengths[: full_chunks * PREFILL_DISPATCH_CHUNK_QUERIES].reshape(
+                    full_chunks, PREFILL_DISPATCH_CHUNK_QUERIES
+                ),
+            ),
+        )
+
+    return choices
+
+
+def _select_sc_for_tail(blocks, lengths, starts, cache, offset, tail, num_tiles):
+    """Pad only tail metadata for selection, at the tail's original call site."""
+    padded = (tail + 255) // 256 * 256
+    ids = jnp.pad(blocks[offset:], ((0, padded - tail), (0, 0)), constant_values=-1)
+    ls = jnp.pad(lengths[offset:], (0, padded - tail))
+    return _select_sc_for_chunk(ids, ls, starts, offset, tail, num_tiles, cache.dtype)
 
 
 def _direct_tc(query, gate, blocks, lengths, table, cache):
@@ -199,8 +227,13 @@ def _ragged_tc_write(arrays, cache, starts, output, offset, size):
     return lax.fori_loop(0, len(starts) - 1, request, output)
 
 
+def _nonempty_request_starts_are_q256_aligned(starts):
+    """Ignore padded empty requests when checking Q256 start alignment."""
+    return jnp.all((starts[:-1] % 256 == 0) | (jnp.diff(starts) == 0))
+
+
 def _tc(query, gate, blocks, lengths, table, cache, starts):
-    aligned = jnp.all((starts[:-1] % 256 == 0) | (jnp.diff(starts) == 0))
+    aligned = _nonempty_request_starts_are_q256_aligned(starts)
     arrays = (query, gate, blocks, lengths, table)
     return lax.cond(
         aligned,
@@ -214,7 +247,7 @@ def _tc(query, gate, blocks, lengths, table, cache, starts):
 
 def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype):
     local = jnp.clip(starts - offset, 0, size)
-    aligned = jnp.all((local[:-1] % 256 == 0) | (jnp.diff(local) == 0))
+    aligned = _nonempty_request_starts_are_q256_aligned(local)
     # A boundary inside a TC tile changes the padded schedule; its fitted
     # Q256 union costs no longer describe the actual work. Keep TC there.
     return lax.cond(
@@ -263,91 +296,99 @@ def _one_chunk(arrays, cache, starts):
 
 def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=False):
     def tc(output):
-        local = jnp.clip(starts - offset, 0, size)
-        aligned = jnp.all((local[:-1] % 256 == 0) | (jnp.diff(local) == 0))
-
-        def direct(output):
-            if tail:
-                padding = (-size) % 256
-                chunk_arrays = tuple(
-                    jnp.pad(
-                        x[offset:],
-                        ((0, padding),) + ((0, 0),) * (x.ndim - 1),
-                        constant_values=-1 if i == 2 else 0,
-                    )
-                    for i, x in enumerate(arrays)
-                )
-            else:
-                chunk_arrays = tuple(
-                    lax.dynamic_slice_in_dim(x, offset, size) for x in arrays
-                )
-            query, gate, blocks, lengths, table = chunk_arrays
-            result = _direct_tc(query, gate, blocks, lengths, table, cache)[:size]
-            return lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
-
-        # Align only one request-local Q256 tile directly into the final
-        # output. Do not retain full-chunk Q/gate copies and a separate
-        # full-chunk ragged output across the request loop.
-        return lax.cond(
-            aligned,
-            direct,
-            lambda out: _ragged_tc_write(arrays, cache, starts, out, offset, size),
-            output,
-        )
+        return _write_tc_chunk(arrays, cache, starts, output, offset, size, tail=tail)
 
     def sc(output):
-        chunk = SC_CHUNK_SIZE[jnp.dtype(cache.dtype)]
+        return _write_sc_chunk(arrays, cache, output, offset, size, tail=tail)
 
-        def micro(i, output):
-            start = offset + i * chunk
-            query, gate, blocks, lengths, table = tuple(
-                lax.dynamic_slice_in_dim(x, start, chunk) for x in arrays
-            )
-            result, _ = sc_grouped_attention(
-                query,
-                gate,
-                blocks,
-                lengths,
-                table,
-                cache,
-                kv_heads=2,
-                ratio=4,
-                query_group=8,
-                tile_k=256,
-            )
-            return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
+    return lax.cond(choose, sc, tc, output)
 
-        if size // chunk:
-            output = lax.fori_loop(0, size // chunk, micro, output)
-        if tail and size % chunk:
-            live = size % chunk
-            start = offset + size - live
-            query, gate, blocks, lengths, table = tuple(
+
+def _write_tc_chunk(arrays, cache, starts, output, offset, size, *, tail=False):
+    """Write aligned TC work or request-local ragged tiles into the final output."""
+    local = jnp.clip(starts - offset, 0, size)
+    aligned = _nonempty_request_starts_are_q256_aligned(local)
+
+    def direct(output):
+        if tail:
+            padding = (-size) % 256
+            chunk_arrays = tuple(
                 jnp.pad(
-                    x[start:],
-                    ((0, chunk - live),) + ((0, 0),) * (x.ndim - 1),
+                    x[offset:],
+                    ((0, padding),) + ((0, 0),) * (x.ndim - 1),
                     constant_values=-1 if i == 2 else 0,
                 )
                 for i, x in enumerate(arrays)
             )
-            result, _ = sc_grouped_attention(
-                query,
-                gate,
-                blocks,
-                lengths,
-                table,
-                cache,
-                kv_heads=2,
-                ratio=4,
-                query_group=8,
-                tile_k=256,
+        else:
+            chunk_arrays = tuple(
+                lax.dynamic_slice_in_dim(x, offset, size) for x in arrays
             )
-            output = lax.dynamic_update_slice_in_dim(
-                output, result[:live], start, axis=0
-            )
-        return output
+        query, gate, blocks, lengths, table = chunk_arrays
+        result = _direct_tc(query, gate, blocks, lengths, table, cache)[:size]
+        return lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
 
-    return lax.cond(choose, sc, tc, output)
+    # Align only one request-local Q256 tile directly into the final
+    # output. Do not retain full-chunk Q/gate copies and a separate
+    # full-chunk ragged output across the request loop.
+    return lax.cond(
+        aligned,
+        direct,
+        lambda out: _ragged_tc_write(arrays, cache, starts, out, offset, size),
+        output,
+    )
+
+
+def _write_sc_chunk(arrays, cache, output, offset, size, *, tail=False):
+    """Gather and write one SC microchunk at a time, including a padded tail."""
+    chunk = SC_CHUNK_SIZE[jnp.dtype(cache.dtype)]
+
+    def micro(i, output):
+        start = offset + i * chunk
+        query, gate, blocks, lengths, table = tuple(
+            lax.dynamic_slice_in_dim(x, start, chunk) for x in arrays
+        )
+        result, _ = sc_grouped_attention(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=2,
+            ratio=4,
+            query_group=8,
+            tile_k=256,
+        )
+        return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
+
+    if size // chunk:
+        output = lax.fori_loop(0, size // chunk, micro, output)
+    if tail and size % chunk:
+        live = size % chunk
+        start = offset + size - live
+        query, gate, blocks, lengths, table = tuple(
+            jnp.pad(
+                x[start:],
+                ((0, chunk - live),) + ((0, 0),) * (x.ndim - 1),
+                constant_values=-1 if i == 2 else 0,
+            )
+            for i, x in enumerate(arrays)
+        )
+        result, _ = sc_grouped_attention(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=2,
+            ratio=4,
+            query_group=8,
+            tile_k=256,
+        )
+        output = lax.dynamic_update_slice_in_dim(output, result[:live], start, axis=0)
+    return output
 
 
 def _sc_prefill(q, gate, blocks, lengths, table, cache, *, chunk_size):

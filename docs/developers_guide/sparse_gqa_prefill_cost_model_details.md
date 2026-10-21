@@ -49,8 +49,9 @@ are not isolated hardware instruction latencies.
 - **Derived mask layout — 64 and 2:** A KV256 tile has 64 compressed groups
   represented by two 32-bit words.
 - **Mask alignment — 128:** Alignment of the mask word dimension.
-- **Outer chunk — 8192:** Current scheduling chunk size. The fitter
-  independently uses 8192 to scale query features.
+- **Outer dispatch — `PREFILL_DISPATCH_CHUNK_QUERIES = 8192`:** Maximum query
+  rows per outer dispatch chunk. Larger inputs are split into full chunks and a
+  remainder.
 - **SC microchunks — 32 and 64:** BF16 and FP8 transport scheduling,
   respectively.
 - **Policy — `_TC_PREFERENCE_FACTOR = 1.02`:** Prefer TC near the predicted

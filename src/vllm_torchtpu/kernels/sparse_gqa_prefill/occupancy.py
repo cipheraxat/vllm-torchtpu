@@ -17,18 +17,34 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+# Logical cache geometry, independent of hardware capacity limits.
+_COMPRESSION_RATIO = 4
+_GROUPS_PER_KV_TILE = 64
+_KV_TILE_SIZE = _COMPRESSION_RATIO * _GROUPS_PER_KV_TILE
+
+# Metadata schedule used by the calibrated Q256 selector.
+_QUERY_BLOCK_SIZE = 256
+_SAMPLE_STRIDE = 32
+
 
 def active_counts(
-    blocks: jax.Array, lengths: jax.Array, *, num_tiles: int, query_block: int = 256
+    blocks: jax.Array,
+    lengths: jax.Array,
+    *,
+    num_tiles: int,
+    query_block: int = _QUERY_BLOCK_SIZE,
 ) -> jax.Array:
     def one(xs):
         ids, ls = xs
-        groups = jnp.concatenate((ids, (ls // 4)[:, None]), axis=1)
+        groups = jnp.concatenate((ids, (ls // _COMPRESSION_RATIO)[:, None]), axis=1)
         valid = jnp.concatenate(
-            ((ids >= 0) & (ls[:, None] > 0), ((ls > 0) & (ls % 4 != 0))[:, None]),
+            (
+                (ids >= 0) & (ls[:, None] > 0),
+                ((ls > 0) & (ls % _COMPRESSION_RATIO != 0))[:, None],
+            ),
             axis=1,
         )
-        indices = jnp.where(valid, groups // 64, num_tiles).reshape(-1)
+        indices = jnp.where(valid, groups // _GROUPS_PER_KV_TILE, num_tiles).reshape(-1)
         touched = (
             jnp.zeros((num_tiles,), jnp.int32)
             .at[indices]
@@ -47,13 +63,15 @@ def active_counts(
 
 
 def span_counts(
-    blocks: jax.Array, lengths: jax.Array, *, query_block: int = 256
+    blocks: jax.Array, lengths: jax.Array, *, query_block: int = _QUERY_BLOCK_SIZE
 ) -> jax.Array:
     live = (blocks >= 0) & (lengths[:, None] > 0)
-    lo = jnp.min(jnp.where(live, blocks // 64, jnp.iinfo(jnp.int32).max), axis=1)
-    hi = jnp.max(jnp.where(live, blocks // 64, -1), axis=1)
-    tail_live = (lengths > 0) & (lengths % 4 != 0)
-    tail = lengths // 256
+    lo = jnp.min(
+        jnp.where(live, blocks // _GROUPS_PER_KV_TILE, jnp.iinfo(jnp.int32).max), axis=1
+    )
+    hi = jnp.max(jnp.where(live, blocks // _GROUPS_PER_KV_TILE, -1), axis=1)
+    tail_live = (lengths > 0) & (lengths % _COMPRESSION_RATIO != 0)
+    tail = lengths // _KV_TILE_SIZE
     lo = jnp.where(tail_live, jnp.minimum(lo, tail), lo)
     hi = jnp.where(tail_live, jnp.maximum(hi, tail), hi)
     lo = lo.reshape(-1, query_block).min(axis=1)
@@ -66,9 +84,24 @@ def sampled_metadata(
 ) -> tuple[jax.Array, jax.Array]:
     # Eight evenly spaced members of each Q256 block. Their tile union is a
     # mathematical lower bound on the full union, never an extrapolation.
-    ids = blocks.reshape(-1, 256, blocks.shape[1])[:, ::32]
-    ls = lengths.reshape(-1, 256)[:, ::32]
+    ids = blocks.reshape(-1, _QUERY_BLOCK_SIZE, blocks.shape[1])[:, ::_SAMPLE_STRIDE]
+    ls = lengths.reshape(-1, _QUERY_BLOCK_SIZE)[:, ::_SAMPLE_STRIDE]
     return ids.reshape(-1, blocks.shape[1]), ls.reshape(-1)
+
+
+def _logical_tiles_and_live_mask(blocks: jax.Array, lengths: jax.Array):
+    """Keep complete groups first and the partial compression tail last."""
+    tiles = jnp.concatenate(
+        (blocks // _GROUPS_PER_KV_TILE, (lengths // _KV_TILE_SIZE)[:, None]), axis=1
+    )
+    live = jnp.concatenate(
+        (
+            (blocks >= 0) & (lengths[:, None] > 0),
+            ((lengths > 0) & (lengths % _COMPRESSION_RATIO != 0))[:, None],
+        ),
+        axis=1,
+    )
+    return tiles, live
 
 
 def bucket_upper_counts(
@@ -76,17 +109,10 @@ def bucket_upper_counts(
     lengths: jax.Array,
     *,
     num_tiles: int,
-    query_block: int = 256,
+    query_block: int = _QUERY_BLOCK_SIZE,
 ) -> jax.Array:
     """Bound unions with a 32-bit bitmap of coarse logical tile buckets."""
-    tiles = jnp.concatenate((blocks // 64, (lengths // 256)[:, None]), axis=1)
-    live = jnp.concatenate(
-        (
-            (blocks >= 0) & (lengths[:, None] > 0),
-            ((lengths > 0) & (lengths % 4 != 0))[:, None],
-        ),
-        axis=1,
-    )
+    tiles, live = _logical_tiles_and_live_mask(blocks, lengths)
     bits = jnp.iinfo(jnp.uint32).bits
     width = (num_tiles + bits - 1) // bits
     buckets = jnp.where(live, tiles // width, 0).astype(jnp.uint32)
@@ -104,16 +130,9 @@ def exact_counts(blocks: jax.Array, lengths: jax.Array, *, num_tiles: int) -> ja
         UNION_WORD_BATCH_SIZE,
     )
 
-    tiles = jnp.concatenate((blocks // 64, (lengths // 256)[:, None]), axis=1)
-    live = jnp.concatenate(
-        (
-            (blocks >= 0) & (lengths[:, None] > 0),
-            ((lengths > 0) & (lengths % 4 != 0))[:, None],
-        ),
-        axis=1,
-    )
+    tiles, live = _logical_tiles_and_live_mask(blocks, lengths)
     word_bits = jnp.iinfo(jnp.uint32).bits
-    words = (tiles // word_bits).reshape(-1, 256, tiles.shape[-1])
+    words = (tiles // word_bits).reshape(-1, _QUERY_BLOCK_SIZE, tiles.shape[-1])
     bits = jnp.where(
         live,
         jnp.uint32(1) << (tiles % word_bits).astype(jnp.uint32),
