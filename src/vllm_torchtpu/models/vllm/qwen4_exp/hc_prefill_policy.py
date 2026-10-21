@@ -19,11 +19,12 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 
 HcPrefillMode = int | Literal["auto"]
 
-# Synchronized HC-only off/on measurements, not a universal size threshold:
+# Minimum-token policy based on synchronized HC-only off/on measurements.
+# Larger aligned lengths extend that policy, not per-shape measured coverage:
 # https://github.com/vllm-project/vllm-torchtpu/pull/1961#issuecomment-6306985716
 _MEASURED_HARDWARE = HcHardware("7x", 64 << 20, 128, 16, 8, 256)
-_MIX_TOKENS = (1024, 2048, 8192)
-_COMBINE_TOKENS = (1024, 2048, 8192)
+_MIX_MIN_TOKENS = 1024
+_COMBINE_MIN_TOKENS = 1024
 
 
 def validate_hc_prefill_mode(value: object, *, full_mix: bool) -> HcPrefillMode:
@@ -55,32 +56,32 @@ def _measured_geometry(
     )
 
 
-def full_mix_auto_tokens(
+def full_mix_auto_min_tokens(
     hardware: HcHardware | None,
     branches: int,
     hidden: int,
     lowrank: int,
     per_branch_norm: bool,
     eps: float,
-) -> tuple[int, ...]:
+) -> int | None:
     return (
-        _MIX_TOKENS
+        _MIX_MIN_TOKENS
         if _measured_geometry(hardware, branches, hidden, lowrank, per_branch_norm, eps)
-        else ()
+        else None
     )
 
 
-def combine_auto_tokens(
+def combine_auto_min_tokens(
     hardware: HcHardware | None,
     branches: int,
     hidden: int,
     lowrank: int,
     per_branch_norm: bool,
     eps: float,
-) -> tuple[int, ...]:
+) -> int | None:
     # Preserve the measured normalization/projection context even without mix.
     return (
-        _COMBINE_TOKENS
+        _COMBINE_MIN_TOKENS
         if _measured_geometry(hardware, branches, hidden, lowrank, per_branch_norm, eps)
-        else ()
+        else None
     )

@@ -23,8 +23,8 @@ from vllm.models.qwen4_exp.common import hyperconnection as common_hc
 
 from vllm_torchtpu.models.vllm.qwen4_exp.hc_prefill_policy import (
     HcPrefillMode,
-    combine_auto_tokens,
-    full_mix_auto_tokens,
+    combine_auto_min_tokens,
+    full_mix_auto_min_tokens,
     validate_hc_prefill_mode,
 )
 
@@ -63,8 +63,8 @@ class GatedResidual(common_hc.GatedResidual):
         self._combine_token_tile = (
             128 if prefill_combine_tile == "auto" else prefill_combine_tile
         )
-        self._auto_mix_tokens: tuple[int, ...] = ()
-        self._auto_combine_tokens: tuple[int, ...] = ()
+        self._auto_mix_min_tokens: int | None = None
+        self._auto_combine_min_tokens: int | None = None
         self._prefill_full_op = None
         self._prefill_combine_op = None
         if not (prefill_full_tile or prefill_combine_tile):
@@ -90,11 +90,14 @@ class GatedResidual(common_hc.GatedResidual):
             self.config.hc_per_branch_norm,
             self.hc_norm.variance_epsilon,
         )
-        self._auto_mix_tokens = full_mix_auto_tokens(*policy_args)
-        self._auto_combine_tokens = combine_auto_tokens(*policy_args)
+        self._auto_mix_min_tokens = full_mix_auto_min_tokens(*policy_args)
+        self._auto_combine_min_tokens = combine_auto_min_tokens(*policy_args)
         if (
             hasattr(self, "block_inject_weight")
-            and (prefill_combine_tile != "auto" or self._auto_combine_tokens)
+            and (
+                prefill_combine_tile != "auto"
+                or self._auto_combine_min_tokens is not None
+            )
             and supports_residual(
                 self.hc_count, self.hidden_size, self._combine_token_tile, hardware
             )
@@ -105,7 +108,7 @@ class GatedResidual(common_hc.GatedResidual):
         if (
             self.config.hc_per_branch_norm
             and hasattr(self, "input_mix_weight_down")
-            and (prefill_full_tile != "auto" or self._auto_mix_tokens)
+            and (prefill_full_tile != "auto" or self._auto_mix_min_tokens is not None)
             and supports_full_mix(
                 self.hc_count,
                 self.hidden_size,
@@ -149,7 +152,8 @@ class GatedResidual(common_hc.GatedResidual):
             and (
                 self.prefill_full_tile != "auto"
                 or (
-                    hyper_input.shape[0] in self._auto_mix_tokens
+                    self._auto_mix_min_tokens is not None
+                    and hyper_input.shape[0] >= self._auto_mix_min_tokens
                     and hyper_input.device.type == "tpu"
                     and self.hc_norm.weight.device == hyper_input.device
                     and self.input_mix_weight_down.weight.device == hyper_input.device
@@ -207,7 +211,8 @@ class GatedResidual(common_hc.GatedResidual):
             and (
                 self.prefill_combine_tile != "auto"
                 or (
-                    hyper_input.shape[0] in self._auto_combine_tokens
+                    self._auto_combine_min_tokens is not None
+                    and hyper_input.shape[0] >= self._auto_combine_min_tokens
                     and hyper_input.device.type == "tpu"
                     and block_output.device == hyper_input.device
                     and hyper_input_normed.device == hyper_input.device

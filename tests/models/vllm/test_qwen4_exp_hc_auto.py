@@ -65,21 +65,7 @@ def route_view(module):
     Production guards are executed unmodified, while dtype/policy/factory facts
     come from the real constructor. These are CPU policy tests, not TPU runs.
     """
-    view = SimpleNamespace(
-        **{
-            name: getattr(module, name)
-            for name in (
-                "prefill_full_tile",
-                "prefill_combine_tile",
-                "_prefill_full_op",
-                "_prefill_combine_op",
-                "_full_token_tile",
-                "_combine_token_tile",
-                "_auto_mix_tokens",
-                "_auto_combine_tokens",
-            )
-        }
-    )
+    view = SimpleNamespace(**vars(module))
     for name in (
         "hc_norm",
         "input_mix_weight_down",
@@ -153,12 +139,33 @@ def test_independent_modes(full, combine, expected, boundaries):
 
 
 @pytest.mark.parametrize(
-    "tokens", [1, 32, 128, 256, 512, 1024, 2048, 8192, 127, 129, 257, 1536, 4096, 8320]
+    "tokens",
+    [
+        1,
+        32,
+        128,
+        256,
+        512,
+        640,
+        768,
+        1023,
+        1024,
+        1152,
+        1536,
+        2048,
+        4096,
+        8192,
+        8320,
+        127,
+        129,
+        257,
+        1025,
+    ],
 )
-def test_exact_measured_token_set(tokens, boundaries):
+def test_auto_minimum_threshold_and_full_tile_alignment(tokens, boundaries):
     module = meta_module()
     x, block = route_inputs(tokens)
-    selected = tokens in (1024, 2048, 8192)
+    selected = tokens >= 1024 and tokens % 128 == 0
     assert mix_selected(module, x) is selected
     assert combine_selected(module, block, x, x) is selected
 
@@ -302,7 +309,7 @@ def test_no_backend_initialization_and_frozen_unknown_facts(monkeypatch):
     assert module._prefill_full_op is module._prefill_combine_op is None
     # Moving a module does not refresh a captured policy; no implicit init/query.
     module.to(dtype=torch.float32)
-    assert module._auto_mix_tokens == module._auto_combine_tokens == ()
+    assert module._auto_mix_min_tokens is module._auto_combine_min_tokens is None
 
 
 def test_auto_fallback_actual_math_and_no_fused_call(monkeypatch):
@@ -310,7 +317,7 @@ def test_auto_fallback_actual_math_and_no_fused_call(monkeypatch):
     from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
 
     def forbidden(*args):
-        pytest.fail("unmeasured row count reached fused HC")
+        pytest.fail("CPU fallback reached fused HC")
 
     monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: MEASURED)
     monkeypatch.setattr(vllm_adapter, "build_full_mix_op", lambda *a: forbidden)
