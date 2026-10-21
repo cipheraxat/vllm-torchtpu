@@ -11,10 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Default tile sizing rules for `vllm_torchtpu.megakernel` (`default`)."""
+"""Checked-in named execution profiles.
+
+`default` holds the `default` profile's model-agnostic tile rule (imported
+eagerly; it depends only on `exec_spec`). Named profiles register themselves when
+their module is imported; `profile.get_profile` / `list_profiles` call
+`load_builtin_profiles()` first. A model's default profile lives with the model
+and registers when the model is imported.
+"""
 
 from __future__ import annotations
 
 from . import default
 
-__all__ = ["default"]
+
+def load_builtin_profiles() -> None:
+    """Import (and thereby register) every checked-in named profile."""
+
+
+__all__ = ["default", "load_builtin_profiles"]
