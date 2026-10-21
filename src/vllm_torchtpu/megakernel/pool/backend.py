@@ -197,6 +197,9 @@ def make_pool_backend(
             "recurrent block's chunking, e.g. GDNBlock.chunk_rows): without it "
             "in-kernel gather is never eligible"
         )
+    # Local imports: the kernels import the shared checks from this module.
+    from .gather import gather_gdn_states
+
     has_rec = layout.has_recurrent
 
     def _gather(
@@ -206,13 +209,21 @@ def make_pool_backend(
         read_offsets: jax.Array | None,
         active_seqs: Any,
     ) -> dict[str, Any]:
-        del raw_pools, active_seqs
         if not has_rec or cache_exec(ex_paged).GPR:
             return {}
         assert ckpt_indices is not None and read_offsets is not None
         if check is not None:
             check(ex_paged)
-        return {}
+        conv, rec = gather_gdn_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            interpret=ex_paged.interpret,
+        )
+        return {"conv": conv, "rec": rec}
 
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:
         return can_pool_gather(layout, ex_paged, rec_chunk)
