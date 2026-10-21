@@ -232,6 +232,8 @@ class HostPLETable(_LoadedPLETable):
         table = self._shared_table
         if table is None:
             return super()._copy_checkpoint(param, loaded_weight, checkpoint_start)
+        # Readers still consume upstream tensors for dtype/coverage checks.
+        # Only the destination copy is skipped; source I/O depends on the loader.
         if table.is_writer:
             with table.writable_buffer() as buffer:
                 destination = torch.frombuffer(

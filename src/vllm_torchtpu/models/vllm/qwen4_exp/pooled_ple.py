@@ -118,22 +118,48 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
     def _lookup_ids(
         self, inputs: PLEInputs, valid_tokens: torch.Tensor
     ) -> torch.Tensor:
-        request, chunk_pos = token_requests(
-            inputs.query_start_loc, inputs.input_ids.shape[0]
+        if inputs.ngram_context.shape[0] == 0:
+            # No local requests, but DP peers may still need this rank's table.
+            ids = inputs.input_ids.new_full(
+                (
+                    inputs.input_ids.shape[0],
+                    self.ple_embedding.ngram_heads_vocab_sizes.numel(),
+                ),
+                -1,
+                dtype=torch.int32,
+            )
+        else:
+            request, chunk_pos = token_requests(
+                inputs.query_start_loc, inputs.input_ids.shape[0]
+            )
+            ids = self.ple_embedding.compute_ids(
+                inputs.input_ids, inputs.ngram_context, request, chunk_pos
+            )
+            # Hash products use int64. Bounded row ids cross an int32 Pallas ABI.
+            ids = ids.to(torch.int32)
+            valid = torch.arange(ids.shape[0], device=ids.device) < valid_tokens
+            ids = torch.where(valid[:, None], ids, -1)
+        return self.parallel.gather_ids(ids)
+
+    def _empty_raw(self, inputs: PLEInputs) -> torch.Tensor:
+        width = (
+            self.ple_embedding.ngram_embedding.embedding_dim
+            * self.ple_embedding.ngram_heads_vocab_sizes.numel()
         )
-        ids = self.ple_embedding.compute_ids(
-            inputs.input_ids, inputs.ngram_context, request, chunk_pos
+        return inputs.input_ids.new_zeros(
+            (inputs.input_ids.shape[0], width),
+            dtype=torch.int8
+            if self.storage.storage_dtype == torch.float8_e4m3fn
+            else torch.int16,
         )
-        # Hash products use int64. The bounded row ids cross an int32 Pallas ABI.
-        ids = ids.to(torch.int32)
-        valid = torch.arange(ids.shape[0], device=ids.device) < valid_tokens
-        return self.parallel.gather_ids(torch.where(valid[:, None], ids, -1))
 
     def lookup_for_model(
         self, inputs: PLEInputs, valid_tokens: torch.Tensor
     ) -> torch.Tensor:
         """Compute ids on device, then cross the eager host lookup boundary."""
         assert self.cpu_offload
+        if inputs.ngram_context.shape[0] == 0 and not self.parallel.across_dp:
+            return self._empty_raw(inputs).unsqueeze(0)
         ids = self._lookup_ids(inputs, valid_tokens)
         return host_lookup(
             ids,
@@ -166,8 +192,15 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             ).clone()
         else:
             assert isinstance(self.storage, ResidentPLETable)
-            raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
+            raw = (
+                self._empty_raw(inputs)
+                if state_indices.shape[0] == 0 and not self.parallel.across_dp
+                else self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
+            )
         raw = self.parallel.combine(raw, hidden_states.shape[0])
+        # Keep owner collectives above the local-empty return, including on DP.
+        if state_indices.shape[0] == 0:
+            return torch.zeros_like(hidden_states)
         gated = self.gated_values(hidden_states, self.storage.decode(raw))
         conv = self._conv(
             self.norm_conv(gated),
@@ -177,8 +210,6 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             state_indices,
             has_initial_states,
         )
-        if state_indices.shape[0] == 0:
-            return torch.zeros_like(hidden_states)
         request, _ = token_requests(inputs.query_start_loc, hidden_states.shape[0])
         valid = (
             torch.arange(hidden_states.shape[0], device=hidden_states.device)

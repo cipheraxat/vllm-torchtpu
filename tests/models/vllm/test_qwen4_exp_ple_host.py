@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 
-def backend():
+def backend_module():
     path = (
         Path(__file__).parents[3] / "src/vllm_torchtpu/models/vllm/"
         "qwen4_exp/ple_host.py"
@@ -19,7 +19,11 @@ def backend():
     spec = importlib.util.spec_from_file_location("ple_host_probe", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.SharedPLETable
+    return module
+
+
+def backend():
+    return backend_module().SharedPLETable
 
 
 def write(table, offset, value):
@@ -227,3 +231,47 @@ def test_reader_failure_cannot_publish_shared_checkpoint(tmp_path, failure):
             if process.is_alive():
                 process.kill()
             process.join(10)
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_process_identity_disappeared_during_proc_read(monkeypatch, error):
+    module = backend_module()
+
+    def disappeared(path):
+        raise error("process disappeared")
+
+    monkeypatch.setattr(Path, "read_text", disappeared)
+    assert module._process_identity(123) is None
+    with pytest.raises(RuntimeError, match="writer exited"):
+        module.SharedPLETable._check_writer({"writer": {"pid": 123, "start": "10"}})
+
+
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_process_identity_does_not_hide_other_read_errors(monkeypatch, error):
+    module = backend_module()
+
+    def failed(path):
+        raise error("not a disappearance")
+
+    monkeypatch.setattr(Path, "read_text", failed)
+    with pytest.raises(error, match="not a disappearance"):
+        module._process_identity(123)
+
+
+@pytest.mark.parametrize(
+    "state,start", [("S", "10"), ("Z", "10"), ("X", "10"), ("S", "11")]
+)
+def test_process_identity_checks_liveness_and_pid_reuse(monkeypatch, state, start):
+    module = backend_module()
+    fields = [state, *(["0"] * 18), start]
+    monkeypatch.setattr(
+        Path, "read_text", lambda path: "123 (name with ) spaces) " + " ".join(fields)
+    )
+    expected = start if state == "S" else None
+    assert module._process_identity(123) == expected
+    record = {"writer": {"pid": 123, "start": "10"}}
+    if expected == "10":
+        module.SharedPLETable._check_writer(record)
+    else:
+        with pytest.raises(RuntimeError, match="writer exited"):
+            module.SharedPLETable._check_writer(record)

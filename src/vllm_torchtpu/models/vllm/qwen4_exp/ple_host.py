@@ -43,9 +43,10 @@ def shared_ple_options(
 
 
 def _process_identity(pid):
+    # A proc entry can disappear before open (ENOENT) or during read (ESRCH).
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     if fields[0] in ("Z", "X"):
         return None

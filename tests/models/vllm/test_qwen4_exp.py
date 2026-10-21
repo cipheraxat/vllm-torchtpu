@@ -1333,3 +1333,122 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
             torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
     if isinstance(adapted.storage, ple_storage.HostPLETable):
         adapted.storage.close()
+
+
+@pytest.mark.parametrize("host", [False, True], ids=["resident", "host"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("num_tokens", [0, 5], ids=["zero_tokens", "padding_only"])
+@pytest.mark.parametrize("across_dp", [False, True], ids=["local", "dp_peer"])
+def test_ple_zero_requests_keep_owner_collectives(
+    monkeypatch, host, fp8, num_tokens, across_dp
+):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload, pooled_ple
+    from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
+
+    _set_tp(monkeypatch, 0, 1)
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("empty local requests must not hash/decode/convolve")
+
+    class Group:
+        rank_in_group = 0
+
+        def __init__(self, name, size):
+            self.name, self.world_size = name, size
+
+        def all_gather(self, ids, dim):
+            calls.append("gather")
+            assert ids.shape == (num_tokens, 4) and bool((ids == -1).all())
+            # Peer rows must still be served by the local table owner.
+            return torch.cat((ids, torch.zeros_like(ids)), dim=dim)
+
+        def all_reduce(self, rows):
+            calls.append(self.name)
+            return rows
+
+    tp, dp = Group("tp", 1), Group("dp", 2 if across_dp else 1)
+    parallel = PLEParallel(tp, dp, embedding_across_dp=across_dp)
+    config = _text_config(
+        **dict(_PLE, ple_embedding_dtype="float8_e4m3fn" if fp8 else None)
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = pooled_ple.Qwen4ExpPooledPLE(
+            config,
+            0,
+            None,
+            "ple",
+            parallel=parallel,
+            table_group=Group("table", parallel.world_size),
+            cpu_offload=host,
+        )
+    # No weights are read on the empty branch except peer raw rows. Check that
+    # ownership work explicitly; normal loaded-layer math is tested above.
+    layer._finalized = True
+    layer._conv = forbidden
+    history = torch.full((2, *layer.state_shape), 7, dtype=torch.bfloat16)
+    layer.cache_owners = (history,)
+    before = history.clone()
+    monkeypatch.setattr(layer, "gated_values", forbidden)
+    monkeypatch.setattr(layer.storage, "decode", forbidden)
+    width = layer.storage.embedding_dim * 4
+    carrier = torch.int8 if fp8 else torch.int16
+
+    def lookup(ids):
+        calls.append("lookup")
+        assert across_dp and ids.shape == (2 * num_tokens, 4)
+        assert bool((ids[:num_tokens] == -1).all())
+        assert bool((ids[num_tokens:] == 0).all())
+        return (ids[:, :1] == 0).expand(-1, width).to(carrier).clone()
+
+    if host:
+        monkeypatch.setattr(layer.storage, "lookup_host", lookup)
+        monkeypatch.setattr(
+            ple_offload,
+            "get_forward_context",
+            lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+        )
+    else:
+        monkeypatch.setattr(layer.storage, "lookup_raw", lookup)
+    inputs = PLEInputs(
+        torch.zeros(num_tokens, dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.empty(0, 2, dtype=torch.int32),
+    )
+    gathered = layer._lookup_ids(inputs, torch.tensor(0))
+    assert gathered.shape == (dp.world_size * num_tokens, 4)
+    assert bool((gathered[:num_tokens] == -1).all())
+    calls.clear()
+    monkeypatch.setattr(layer.ple_embedding, "compute_ids", forbidden)
+    hidden = torch.full((num_tokens, HC * HIDDEN), 3, dtype=torch.bfloat16)
+    raw = layer.lookup_for_model(inputs, torch.tensor(0)) if host else None
+    if host:
+        assert raw.shape == (dp.world_size, num_tokens, width) and raw.dtype == carrier
+    result = layer.forward_with_history(
+        hidden,
+        inputs,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.bool),
+        torch.tensor(0),
+        raw,
+    )
+    assert result.shape == hidden.shape and result.dtype == hidden.dtype
+    assert bool((result == 0).all())
+    assert layer.cache_owners[0] is history and torch.equal(history, before)
+    assert calls == (["gather", "lookup", "dp", "tp"] if across_dp else ["tp"])
+    if not across_dp:
+        compiled = torch.compile(
+            layer.forward_with_history, backend="eager", fullgraph=True
+        )
+        actual = compiled(
+            hidden,
+            inputs,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.bool),
+            torch.tensor(0),
+            raw,
+        )
+        torch.testing.assert_close(actual, result, rtol=0, atol=0)
+        assert torch.equal(history, before)
