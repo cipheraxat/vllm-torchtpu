@@ -22,6 +22,16 @@ def backend():
     return module.SharedPLETable
 
 
+def write(table, offset, value):
+    with table.writable_buffer() as buffer:
+        buffer[offset : offset + len(value)] = value
+
+
+def read(table, offset, size):
+    with table.buffer() as buffer:
+        return bytes(buffer[offset : offset + size])
+
+
 def writer(directory, connection, *, die=False):
     table = backend()(
         directory=directory,
@@ -33,12 +43,12 @@ def writer(directory, connection, *, die=False):
     )
     try:
         assert table.is_writer
-        table.write(0, b"original")
+        write(table, 0, b"original")
         connection.send((os.getpid(), table.data_fd))
         assert connection.recv() == "continue-loading"
         if die:
             os._exit(7)
-        table.write(8, b"-weights")
+        write(table, 8, b"-weights")
         table.finish()
         connection.send("ready")
         assert connection.recv() == "exit"
@@ -61,14 +71,14 @@ def create(directory, **overrides):
 
 def test_publish_seals_table_and_releases_control_files(tmp_path):
     with create(tmp_path, participants=1) as table:
-        table.write(0, b"checkpoint")
+        write(table, 0, b"checkpoint")
         with pytest.raises(RuntimeError, match="ready"):
-            table.read(0, 10)
+            read(table, 0, 10)
         table.finish()
-        assert table.read(0, 10) == b"checkpoint"
+        assert read(table, 0, 10) == b"checkpoint"
         assert fcntl.fcntl(table.data_fd, fcntl.F_GET_SEALS) & fcntl.F_SEAL_WRITE
         with pytest.raises(RuntimeError, match="read.only|published"):
-            table.write(0, b"changed")
+            write(table, 0, b"changed")
         assert not list(tmp_path.iterdir())
 
 
@@ -90,15 +100,15 @@ def test_reader_attaches_before_writer_finishes_remaining_weights(tmp_path):
             == os.stat(f"/proc/{writer_pid}/fd/{writer_fd}").st_ino
         )
         with pytest.raises(RuntimeError, match="ready"):
-            table.read(0, 16)
+            read(table, 0, 16)
         parent.send("continue-loading")
         table.finish()
         assert parent.poll(30) and parent.recv() == "ready"
-        assert table.read(0, 16) == b"original-weights"
+        assert read(table, 0, 16) == b"original-weights"
         parent.send("exit")
         process.join(10)
         assert process.exitcode == 0
-        assert table.read(0, 16) == b"original-weights"
+        assert read(table, 0, 16) == b"original-weights"
         assert not list(tmp_path.iterdir())
     finally:
         if process.is_alive():
@@ -151,18 +161,18 @@ def test_services_do_not_share_storage(tmp_path):
         create(tmp_path, participants=1) as first,
         create(tmp_path, key="service-b/ple/tp0", participants=1) as second,
     ):
-        first.write(0, b"first")
-        second.write(0, b"other")
+        write(first, 0, b"first")
+        write(second, 0, b"other")
         first.finish()
         second.finish()
         assert os.fstat(first.data_fd).st_ino != os.fstat(second.data_fd).st_ino
-        assert first.read(0, 5) == b"first"
-        assert second.read(0, 5) == b"other"
+        assert read(first, 0, 5) == b"first"
+        assert read(second, 0, 5) == b"other"
 
 
 def test_missing_participant_has_bounded_wait(tmp_path):
     with create(tmp_path, timeout=0.05) as table:
-        table.write(0, b"loaded")
+        write(table, 0, b"loaded")
         with pytest.raises(TimeoutError, match="participants"):
             table.finish()
     # Retain a small failed-generation marker so a late worker cannot create
@@ -191,7 +201,7 @@ def test_reader_failure_cannot_publish_shared_checkpoint(tmp_path, failure):
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
     with create(tmp_path) as table:
-        table.write(0, b"weights")
+        write(table, 0, b"weights")
         process = ctx.Process(
             target=failing_reader, args=(str(tmp_path), child, failure)
         )
@@ -205,7 +215,7 @@ def test_reader_failure_cannot_publish_shared_checkpoint(tmp_path, failure):
             with pytest.raises(RuntimeError, match=message):
                 table.finish(metadata={"scale_bits": 2})
             with pytest.raises(RuntimeError, match="not ready"):
-                table.read(0, 7)
+                read(table, 0, 7)
             if failure == "scale":
                 assert parent.poll(30)
                 assert "metadata mismatch" in parent.recv()

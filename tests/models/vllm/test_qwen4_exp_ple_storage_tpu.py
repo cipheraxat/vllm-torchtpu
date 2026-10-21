@@ -14,6 +14,13 @@ from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import ResidentPLETable
 
 
+@pytest.fixture(autouse=True)
+def _isolated_compile_cache():
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_loaded_compact_table_compiles_and_preserves_checkpoint_rows(monkeypatch, fp8):
@@ -65,12 +72,22 @@ def test_loaded_compact_table_compiles_and_preserves_checkpoint_rows(monkeypatch
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
-def test_native_ple_history_matches_common_layer_on_tpu(monkeypatch, fp8):
+@pytest.mark.parametrize("storage", ["resident", "host", "shared"])
+def test_native_ple_history_matches_common_layer_on_tpu(
+    monkeypatch, tmp_path, fp8, storage
+):
     """Real hash/lookup/projection/gate/convolution with local TP1 group fixtures."""
+    from types import SimpleNamespace
+
     from test_qwen4_exp import _PLE, _text_config
+    from vllm.forward_context import override_forward_context
 
     from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
     from vllm_torchtpu.models.vllm.qwen4_exp.ple import PLEInputs, Qwen4ExpPLELayer
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import (
+        HostPLETable,
+        SharedPLEOptions,
+    )
     from vllm_torchtpu.models.vllm.qwen4_exp.pooled_ple import Qwen4ExpPooledPLE
 
     _set_tp(monkeypatch, 0, 1)
@@ -103,6 +120,10 @@ def test_native_ple_history_matches_common_layer_on_tpu(monkeypatch, fp8):
             "ple",
             parallel=PLEParallel(group, group, embedding_across_dp=False),
             table_group=group,
+            cpu_offload=storage != "resident",
+            shared=SharedPLEOptions(tmp_path, "native", {"fixture": "small"}, 1)
+            if storage == "shared"
+            else None,
         )
     gen = torch.Generator(device="cpu").manual_seed(73)
     with torch.no_grad():
@@ -148,12 +169,24 @@ def test_native_ple_history_matches_common_layer_on_tpu(monkeypatch, fp8):
             expected, updated = reference(
                 hidden, PLEInputs(ids, starts, contexts), windows
             )
+            device_inputs = PLEInputs(
+                ids.to("tpu"), starts.to("tpu"), contexts.to("tpu")
+            )
+            with override_forward_context(
+                SimpleNamespace(no_compile_layers={"ple": adapted})
+            ):
+                raw = (
+                    adapted.lookup_for_model(device_inputs, starts[-1:].to("tpu"))
+                    if adapted.cpu_offload
+                    else None
+                )
             actual = run(
                 hidden.to("tpu"),
-                PLEInputs(ids.to("tpu"), starts.to("tpu"), contexts.to("tpu")),
+                device_inputs,
                 slots.to("tpu"),
                 initial.to("tpu"),
                 starts[-1:].to("tpu"),
+                raw,
             )
             sync.synchronize([actual, device_history], wait=True)
             actual_cpu = actual.cpu()
@@ -170,3 +203,6 @@ def test_native_ple_history_matches_common_layer_on_tpu(monkeypatch, fp8):
             torch.testing.assert_close(
                 device_history.cpu(), history, rtol=0.02, atol=0.002
             )
+
+    if isinstance(adapted.storage, HostPLETable):
+        adapted.storage.close()

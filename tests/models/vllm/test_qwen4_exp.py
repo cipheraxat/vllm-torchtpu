@@ -1121,6 +1121,13 @@ def test_ple_storage_reuses_common_checkpoint_loader(
     )
     try:
         assert table.weight.is_meta == (storage == "shared")
+        if storage != "resident":
+            assert not isinstance(table, ResidentPLETable)
+            assert not hasattr(table, "local_rows")
+            assert not hasattr(table, "lookup_raw")
+            assert "table" not in dict(table.named_buffers())
+            with pytest.raises(NotImplementedError, match="host lookup boundary"):
+                table(torch.tensor([0]))
         weights = [
             (f"ngram_embedding.shard_{i}.weight", shard)
             for i, shard in enumerate(checkpoint.split(22))
@@ -1260,8 +1267,29 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
     full_table = weights.pop("ple_embedding.ngram_embedding.weight")
     for i, rows in enumerate(full_table.split(22)):
         weights[f"ple_embedding.ngram_embedding.shard_{i}.weight"] = rows
-    adapted.load_checkpoint(iter(weights.items()))
+    loader_type = pooled_ple.AutoWeightsLoader
+    constructions = []
+
+    def loader(module):
+        instance = loader_type(module)
+        constructions.append(instance)
+        return instance
+
+    monkeypatch.setattr(pooled_ple, "AutoWeightsLoader", loader)
+    keys = set(adapted.state_dict())
+    assert adapted._checkpoint_loader is None
+    for name, value in weights.items():
+        adapted.load_checkpoint(iter([(name, value)]))
+        assert len(constructions) == 1
+        assert constructions[0].ignore_unexpected_suffixes == [".bias"]
+    assert set(adapted.state_dict()) == keys
+    assert adapted._loaded == set(dict(adapted.named_parameters())) | {
+        "ple_embedding.layer_multipliers",
+        "ple_embedding.ngram_heads_offsets",
+        "ple_embedding.ngram_heads_vocab_sizes",
+    }
     adapted.finalize_weights()
+    assert adapted._checkpoint_loader is None
     monkeypatch.setattr(
         ple_offload,
         "get_forward_context",

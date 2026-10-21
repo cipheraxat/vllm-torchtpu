@@ -324,7 +324,7 @@ class PLETableFactory(Protocol):
         embedding_method: Qwen4ExpPLEEmbeddingMethod,
         padding_size: int,
         prefix: str,
-    ) -> Qwen4ExpPLETable: ...
+    ) -> PLEVocabParallelEmbedding: ...
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -434,7 +434,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         Can be called several times, each with part of the weights.
         """
         table = self.ngram_embedding
-        table_is_fp8 = isinstance(table.embedding_method, Qwen4ExpPLEFp8EmbeddingMethod)
+        table_is_fp8 = isinstance(table.quant_method, Qwen4ExpPLEFp8EmbeddingMethod)
         shard_rows = math.ceil(table.org_vocab_size / self.split_ngram_parts)
         shard_prefix = "ngram_embedding.shard_"
         loaded: set[str] = set()

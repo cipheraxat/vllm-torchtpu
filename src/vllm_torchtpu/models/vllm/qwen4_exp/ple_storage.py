@@ -2,14 +2,15 @@
 """PLE storage extensions using the common table and checkpoint shard loader."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import torch
 from vllm.distributed import GroupCoordinator
 from vllm.models.qwen4_exp.common.ngram_embedding import Qwen4ExpPLEEmbeddingMethod
-from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
+from vllm.models.qwen4_exp.common.ple import (
+    PLEVocabParallelEmbedding,
+    compute_ple_shard_overlap,
+)
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_decode_op,
@@ -17,22 +18,13 @@ from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
 )
 
 from .ple import Qwen4ExpPLETable
-from .ple_host import SharedPLETable
+from .ple_host import SharedPLEOptions, SharedPLETable
 
 
-@dataclass(frozen=True)
-class SharedPLEOptions:
-    directory: Path
-    key: str
-    identity: dict[str, object]
-    participants: int
-
-
-class ResidentPLETable(Qwen4ExpPLETable):
-    """Load CPU rows through upstream, then transfer one compact encoded table."""
+class _LoadedPLETable(PLEVocabParallelEmbedding):
+    """Common checkpoint coverage and decode for compact storage."""
 
     weight: torch.nn.Parameter
-    table: torch.Tensor
 
     def __init__(
         self,
@@ -53,17 +45,14 @@ class ResidentPLETable(Qwen4ExpPLETable):
         super().__init__(
             num_embeddings,
             embedding_dim,
-            embedding_method=embedding_method,
+            quant_method=embedding_method,
             padding_size=padding_size,
             prefix=prefix,
             parallel_group=parallel_group,
         )
+        self.output_dtype = torch.get_default_dtype()
         if self.output_dtype != torch.bfloat16:
             raise ValueError("Compact PLE storage requires BF16 model activations")
-        self.register_buffer("table", torch.empty(0, dtype=torch.uint8))
-        self._raw_lookup: (
-            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
-        ) = None
 
     def allocate_embedding_weight(
         self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
@@ -132,10 +121,33 @@ class ResidentPLETable(Qwen4ExpPLETable):
             end = max(end, stop)
         if end != self.shard_indices.num_org_elements:
             raise ValueError("Missing PLE checkpoint rows")
-        self.embedding_method.process_weights_after_loading(self)
+        self.quant_method.process_weights_after_loading(self)
         self._finish_storage()
         self._decode = build_decode_op()
         self._finalized = True
+
+    def decode(self, raw: torch.Tensor) -> torch.Tensor:
+        assert self._finalized and self._decode is not None
+        if self.storage_dtype == torch.bfloat16:
+            scale = raw.new_ones((), dtype=self.output_dtype)
+        else:
+            scale = self.get_parameter("weight_scale")
+        return self._decode(raw, scale)
+
+    def _finish_storage(self) -> None:
+        raise NotImplementedError
+
+
+class ResidentPLETable(_LoadedPLETable):
+    """Transfer one encoded table to device and retain the dense reference API."""
+
+    forward = Qwen4ExpPLETable.forward
+
+    def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
+        weight = super().allocate_embedding_weight(num_embeddings, embedding_dim, dtype)
+        self.register_buffer("table", torch.empty(0, dtype=torch.uint8))
+        self._raw_lookup = None
+        return weight
 
     def _finish_storage(self) -> None:
         if self.weight.numel() % 128:
@@ -155,20 +167,12 @@ class ResidentPLETable(Qwen4ExpPLETable):
         assert self._finalized and self._raw_lookup is not None
         return self._raw_lookup(self.table, ids)
 
-    def decode(self, raw: torch.Tensor) -> torch.Tensor:
-        assert self._finalized and self._decode is not None
-        if self.storage_dtype == torch.bfloat16:
-            scale = raw.new_ones((), dtype=self.output_dtype)
-        else:
-            scale = self.get_parameter("weight_scale")
-        return self._decode(raw, scale)
-
     def local_rows(self, ids: torch.Tensor) -> torch.Tensor:
         rows = self.decode(self.lookup_raw(ids))
         return rows.reshape(*ids.shape, self.embedding_dim)
 
 
-class HostPLETable(ResidentPLETable):
+class HostPLETable(_LoadedPLETable):
     """Keep checkpoint bytes on CPU, optionally in one sealed shared mapping."""
 
     def __init__(
@@ -277,7 +281,7 @@ class HostPLETable(ResidentPLETable):
             raw = raw.view(torch.int8)
         return raw.reshape(*ids.shape[:-1], ids.shape[-1] * self.embedding_dim)
 
-    def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Host PLE requires the explicit host lookup boundary")
 
     def close(self) -> None:

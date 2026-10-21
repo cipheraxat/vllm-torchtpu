@@ -59,14 +59,15 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self.cpu_offload = cpu_offload
         self.prefix = prefix
         self.cache_owners: tuple[torch.Tensor, ...] = ()
+        self._checkpoint_loader: AutoWeightsLoader | None = None
         self._loaded: set[str] = set()
         self._finalized = False
         self._conv: Callable[..., torch.Tensor] | None = None
 
     @property
-    def storage(self) -> ResidentPLETable:
+    def storage(self) -> ResidentPLETable | HostPLETable:
         table = self.ple_embedding.ngram_embedding
-        assert isinstance(table, ResidentPLETable)
+        assert isinstance(table, (ResidentPLETable, HostPLETable))
         return table
 
     @property
@@ -76,7 +77,14 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
     def load_checkpoint(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if self._finalized:
             raise ValueError("PLE weights are already finalized")
-        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if self._checkpoint_loader is None:
+            self._checkpoint_loader = AutoWeightsLoader(self)
+        loader = self._checkpoint_loader
+        # Upstream retains per-call diagnostics and appends suffix filters.
+        loader.ignore_unexpected_suffixes.clear()
+        loader._skipped_aliases.clear()
+        loader._loaded_params_are_complete = True
+        loaded = loader.load_weights(weights)
         self._loaded.update(loaded)
         return loaded
 
@@ -92,6 +100,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         if missing:
             raise ValueError(f"Missing PLE checkpoint tensors: {sorted(missing)}")
         self.storage.finalize_weights()
+        self._checkpoint_loader = None
         self._finalized = True
 
     def bind_history(self, history: torch.Tensor) -> None:
@@ -156,6 +165,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
                 * self.ple_embedding.heads_per_ngram,
             ).clone()
         else:
+            assert isinstance(self.storage, ResidentPLETable)
             raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
         raw = self.parallel.combine(raw, hidden_states.shape[0])
         gated = self.gated_values(hidden_states, self.storage.decode(raw))

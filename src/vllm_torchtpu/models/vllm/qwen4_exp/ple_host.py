@@ -9,8 +9,17 @@ import mmap
 import os
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True)
+class SharedPLEOptions:
+    directory: Path
+    key: str
+    identity: dict[str, object]
+    participants: int
 
 
 def host_available_memory():
@@ -20,11 +29,13 @@ def host_available_memory():
     raise RuntimeError("PLE host capacity requires Linux MemAvailable")
 
 
-def shared_ple_options(model_config, prefix, tp_rank, tp_size):
+def shared_ple_options(
+    model_config, prefix: str, tp_rank: int, tp_size: int
+) -> SharedPLEOptions:
     """Use the pre-worker descriptor, never the worker's collapsed DP size."""
     launch = model_config._qwen4_exp_ple_host_launch
-    return dict(
-        directory=str(Path(tempfile.gettempdir()) / f"vllm-qwen-ple-{os.getuid()}"),
+    return SharedPLEOptions(
+        directory=Path(tempfile.gettempdir()) / f"vllm-qwen-ple-{os.getuid()}",
         key=f"{launch['instance']}/{prefix}/tp{tp_rank}",
         identity=dict(launch, prefix=prefix, tp_rank=tp_rank, tp_size=tp_size),
         participants=launch["participants"],
@@ -156,14 +167,6 @@ class SharedPLETable:
         if _process_identity(writer["pid"]) != writer["start"]:
             raise RuntimeError("PLE shared writer exited before publication")
 
-    def write(self, offset, value):
-        if not self.is_writer or self._published or self._closed:
-            raise RuntimeError("PLE table is read-only or already published")
-        if offset < 0 or offset + len(value) > self.nbytes:
-            raise ValueError("PLE write exceeds shared table bounds")
-        assert self._mapping is not None
-        self._mapping[offset : offset + len(value)] = value
-
     @contextlib.contextmanager
     def writable_buffer(self):
         """Borrow writer storage for the upstream tensor checkpoint loader."""
@@ -240,14 +243,6 @@ class SharedPLETable:
         except BaseException as exc:
             self.abort(str(exc))
             raise
-
-    def read(self, offset, size):
-        if not self._ready or self._closed:
-            raise RuntimeError("PLE table is not ready")
-        if offset < 0 or size < 0 or offset + size > self.nbytes:
-            raise ValueError("PLE read exceeds shared table bounds")
-        assert self._mapping is not None
-        return self._mapping[offset : offset + size]
 
     @contextlib.contextmanager
     def buffer(self):
