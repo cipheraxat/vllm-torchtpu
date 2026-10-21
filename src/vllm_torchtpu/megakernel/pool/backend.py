@@ -199,6 +199,7 @@ def make_pool_backend(
         )
     # Local imports: the kernels import the shared checks from this module.
     from .gather import gather_gdn_states
+    from .scatter import scatter_pool_states
 
     has_rec = layout.has_recurrent
 
@@ -225,6 +226,35 @@ def make_pool_backend(
         )
         return {"conv": conv, "rec": rec}
 
+    def _scatter(
+        ex_paged: ExecSpec,
+        raw_pools: tuple[jax.Array, ...],
+        pos: jax.Array,
+        page_table: jax.Array,
+        out_map: dict[str, Any],
+        ckpt_indices: jax.Array | None,
+        active_seqs: Any,
+    ) -> tuple[jax.Array, ...]:
+        if check is not None:
+            check(ex_paged)
+        conv_out = out_map.get("conv_ckpt" if ex_paged.VER else "conv")
+        rec_out = out_map.get("rec_ckpt" if ex_paged.VER else "rec")
+        return scatter_pool_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            pos,
+            page_table,
+            out_map["knew"],
+            out_map["vnew"],
+            conv_out if has_rec else None,
+            rec_out if has_rec else None,
+            ckpt_indices if has_rec else None,
+            active_seqs,
+            interpret=ex_paged.interpret,
+            conv_partial=cache_exec(ex_paged).GPR,
+        )
+
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:
         return can_pool_gather(layout, ex_paged, rec_chunk)
 
@@ -232,7 +262,7 @@ def make_pool_backend(
         layout=layout,
         kernel_names=POOL_KERNEL_NAMES,
         gather_states=_gather,
-        scatter_states=None,
+        scatter_states=_scatter,
         can_pool_gather=_can_pool_gather,
         page_table_state_name="page_table",
         supports_fused_io=supports_fused_io,
