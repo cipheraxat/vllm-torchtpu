@@ -141,7 +141,7 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
             torch.full(shape, fill, dtype=dtype)
             for _, shape, dtype, fill in model.get_cache_owner_layouts(4, 3)
         ]
-        auxiliary_shapes = [(4, 16, 1, 128), (3, 8, 32), (3, 8)]
+        auxiliary_shapes = [(4, 16, 1, 128), (3, 8, 32), (3, 8, 2)]
         expected_shapes = (
             [(4, 128, 4, 2, 128)] + auxiliary_shapes
             if cache_dtype == "auto"
@@ -190,21 +190,6 @@ def norm(x, w, eps=1e-6):
     )
 
 
-def round64(x):
-    """Direct FP64->BF16 rounding, avoiding FP32 midpoint double rounding."""
-    x = np.asarray(x, np.float64)
-    m = x.astype(np.float32)
-    tie = (m.view(np.uint32) & 65535) == 32768
-    m = np.where(
-        tie & (m.astype(np.float64) < x),
-        np.nextafter(m, np.float32(np.inf)),
-        np.where(
-            tie & (m.astype(np.float64) > x), np.nextafter(m, np.float32(-np.inf)), m
-        ),
-    )
-    return bf(m)
-
-
 def rope_oracle(x, positions, cache, index=True):
     cs = np.asarray(cache, np.float32)[positions]
     half = cache.shape[-1]
@@ -212,8 +197,14 @@ def rope_oracle(x, positions, cache, index=True):
     c, s = cs[:, 0].reshape(shape), cs[:, 1].reshape(shape)
     a, b = x[..., :half], x[..., half : 2 * half]
     if index:
-        left = round64(a.astype(np.float64) * c - bf(b * s))
-        right = round64(a.astype(np.float64) * s + bf(b * c))
+        left = bf(
+            np.subtract(
+                np.multiply(a, c, dtype=np.float32), bf(b * s), dtype=np.float32
+            )
+        )
+        right = bf(
+            np.add(np.multiply(a, s, dtype=np.float32), bf(b * c), dtype=np.float32)
+        )
     else:
         left, right = bf(a * c - b * s), bf(b * c + a * s)
     return np.concatenate([left, right, x[..., 2 * half :]], -1)
@@ -283,7 +274,7 @@ def test_model_cache_binding_reaches_real_custom_op_schema(dtype, monkeypatch):
         auxiliary = [
             torch.empty(4, 32, 1, 128, dtype=torch.bfloat16),
             torch.empty(3, 8, 128, dtype=torch.bfloat16),
-            torch.empty(3, 8, dtype=torch.int64),
+            torch.empty(3, 8, 2, dtype=torch.int32),
         ]
         if dtype == "auto":
             owners = [
@@ -380,3 +371,187 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
         assert module.get_auxiliary_cache_specs()["compressed_k"].tokens_per_state == 4
         with pytest.raises(ValueError, match="Missing"):
             module.finalize_weights()
+
+
+@pytest.mark.parametrize(
+    "updates,tp,match",
+    [
+        ({}, 0, "positive tp_size"),
+        ({}, -1, "positive tp_size"),
+        ({"num_attention_heads": 0}, 1, "num_attention_heads"),
+        ({"num_attention_heads": 7}, 2, "num_attention_heads"),
+        ({"num_key_value_heads": 0}, 1, "num_key_value_heads"),
+        ({"num_key_value_heads": 3}, 2, "num_key_value_heads"),
+        ({"indexer_kv_heads": 2}, 1, "indexer_kv_heads"),
+        ({"head_dim": 0}, 1, "head_dim"),
+        ({"indexer_head_dim": 0}, 1, "indexer_head_dim"),
+        ({"indexer_n_heads": 0}, 1, "indexer_n_heads"),
+    ],
+)
+def test_invalid_geometry_fails_before_projection_allocation(
+    updates, tp, match, monkeypatch
+):
+    import vllm_torchtpu.models.vllm.qwen4_exp.qsa as module
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid geometry reached weight allocation")
+
+    monkeypatch.setattr(module, "ColumnParallelLinear", forbidden)
+    monkeypatch.setattr(module, "ReplicatedLinear", forbidden)
+    with pytest.raises(ValueError, match=match):
+        Qwen4ExpQSA(
+            config=attention_config(hidden_size=16, **updates),
+            tp_rank=0,
+            tp_size=tp,
+            max_model_len=128,
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_actual_native_factory_fake_dtype_and_fullgraph(position_dtype):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
+
+    build_qsa_op()
+    # Call the registered native op directly, retaining the original position
+    # dtype rather than relying on the wrapper's normalization to int32.
+    op = torch.ops.qwen4_exp.qsa
+    graphs = []
+
+    def record(gm, inputs):
+        graphs.append(gm.code)
+        return gm.forward
+
+    with FakeTensorMode():
+
+        def bf(*shape):
+            return torch.empty(shape, dtype=torch.bfloat16)
+
+        def ii(*shape):
+            return torch.empty(shape, dtype=torch.int32)
+
+        args = (
+            bf(4, 512),
+            bf(4, 128),
+            bf(4, 128),
+            bf(4, 384),
+            bf(128),
+            bf(128),
+            bf(128),
+            bf(128),
+            torch.empty(4, dtype=position_dtype),
+            bf(128, 128),
+            bf(4, 128, 1, 2, 128),
+            bf(4, 32, 1, 128),
+            bf(3, 8, 128),
+            ii(3, 8, 2),
+            ii(3),
+            ii(2),
+            ii(2),
+            ii(2, 2),
+            ii(2, 2),
+            4,
+            64,
+            1e-6,
+            32,
+        )
+        for fn in (
+            op,
+            torch.compile(op, backend=record, fullgraph=True, dynamic=False),
+        ):
+            result = fn(*args)
+            assert result[-1].shape == (4, 67)
+            assert result[-1].dtype == torch.int32
+            assert result[-2].shape == (4, 256)
+            assert result[3].shape == (3, 8, 2) and result[3].dtype == torch.int32
+    assert len(graphs) == 1
+
+
+def test_native_tag_planes_are_donated_and_written_to_the_same_owner(monkeypatch):
+    from vllm_torchtpu.layers.adapter.custom_ops import qsa_op
+
+    calls = []
+
+    class RecordingOp:
+        def register_fake(self, fn):
+            return fn
+
+        def __call__(self, *args):
+            calls.append(args)
+            planes = args[13].clone()
+            # Include signed/unsigned low-plane boundaries and independent
+            # high bits. This tests transport, not a claim of int64 positions.
+            planes[0, 0] = torch.tensor([-2147483648, 2147483647])
+            planes[0, 1] = torch.tensor([2147483647, -2147483648])
+            return (
+                *args[10:13],
+                planes,
+                args[0].new_zeros((4, 256)),
+                args[8].new_full((4, 67), -1),
+            )
+
+    def factory(name, fn, *, donate_argnums):
+        assert donate_argnums == (10, 11, 12, 13)
+        return RecordingOp()
+
+    monkeypatch.setattr(qsa_op.pallas, "jax_op", factory)
+    qsa_op.build_qsa_op.cache_clear()
+    try:
+        op = qsa_op.build_qsa_op()
+        tags = torch.full((3, 8, 2), -1, dtype=torch.int32)
+        owners = (
+            torch.zeros(4, 128, 1, 2, 128, dtype=torch.bfloat16),
+            torch.zeros(4, 32, 1, 128, dtype=torch.bfloat16),
+            torch.zeros(3, 8, 128, dtype=torch.bfloat16),
+            tags,
+        )
+        identities = [(id(x), x.data_ptr()) for x in owners]
+
+        def bf(*shape):
+            return torch.zeros(shape, dtype=torch.bfloat16)
+
+        def ii(*shape):
+            return torch.zeros(shape, dtype=torch.int32)
+
+        args = (
+            bf(4, 512),
+            bf(4, 128),
+            bf(4, 128),
+            bf(4, 384),
+            bf(128),
+            bf(128),
+            bf(128),
+            bf(128),
+            ii(4),
+            bf(128, 128),
+            *owners,
+            ii(3),
+            ii(2),
+            ii(2),
+            ii(2, 2),
+            ii(2, 2),
+            4,
+            64,
+            1e-6,
+            32,
+        )
+        for _ in range(2):
+            op(*args)
+            assert calls[-1][13] is tags
+            assert identities == [(id(x), x.data_ptr()) for x in owners]
+            torch.testing.assert_close(
+                tags[0, :2],
+                torch.tensor(
+                    [[-2147483648, 2147483647], [2147483647, -2147483648]],
+                    dtype=torch.int32,
+                ),
+                rtol=0,
+                atol=0,
+            )
+            assert torch.all(tags[1:] == -1)
+            tags.fill_(-1)  # external slot reset/reuse preserves both planes
+            assert torch.all(tags == -1)
+    finally:
+        qsa_op.build_qsa_op.cache_clear()

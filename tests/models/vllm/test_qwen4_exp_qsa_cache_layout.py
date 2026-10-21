@@ -62,3 +62,32 @@ def test_planner_covers_native_owner_and_binding(dtype, tp, monkeypatch):
         backend.get_impl_cls()
     with pytest.raises(ValueError):
         model.bind_cache_owners([owners[0][..., :-1], *owners[1:]])
+
+
+def test_tag_owner_layout_preserves_two_native_planes_and_checkpoint_keys(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    model = Qwen4ExpQSA(
+        config=q4exp_text_config(hidden_size=16),
+        tp_rank=0,
+        tp_size=1,
+        max_model_len=128,
+        device="cpu",
+    )
+    keys = set(model.state_dict())
+    layouts = model.get_cache_owner_layouts(4, 3)
+    assert layouts[-1] == ("rope_tags", (3, 8, 2), torch.int32, -1)
+    owners = [torch.full(shape, fill, dtype=dt) for _, shape, dt, fill in layouts]
+    model.bind_cache_owners(owners)
+    assert model.cache_owners[-1] is owners[-1]
+    assert torch.all(owners[-1] == -1)
+    assert set(model.state_dict()) == keys
+    assert not any("tag" in k or "cache_owners" in k for k in keys)
+    with pytest.raises(ValueError, match="rope_tags"):
+        model.bind_cache_owners(
+            [*owners[:-1], torch.full((3, 8), -1, dtype=torch.int64)]
+        )

@@ -219,6 +219,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         prefix: str = "",
     ):
         super().__init__()
+        if tp_size <= 0:
+            raise ValueError(f"QSA requires positive tp_size, got {tp_size}")
         if not 0 <= tp_rank < tp_size:
             raise ValueError("QSA requires an in-range TP rank")
         self.tp_rank, self.tp_size, self.prefix = tp_rank, tp_size, prefix
@@ -229,6 +231,31 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.head_dim = int(config.head_dim)
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
+        if self.total_num_heads <= 0 or self.total_num_heads % tp_size:
+            raise ValueError(
+                f"QSA num_attention_heads={self.total_num_heads} must be positive "
+                f"and divisible by tp_size={tp_size}"
+            )
+        if self.total_num_kv_heads <= 0 or (
+            self.total_num_kv_heads % tp_size and tp_size % self.total_num_kv_heads
+        ):
+            raise ValueError(
+                f"QSA num_key_value_heads={self.total_num_kv_heads} must be positive "
+                f"and shard or replicate evenly across tp_size={tp_size}"
+            )
+        if int(config.indexer_kv_heads) != 1:
+            raise ValueError(
+                f"QSA indexer_kv_heads={config.indexer_kv_heads} must be 1 "
+                "for the replicated MQA indexer"
+            )
+        if (
+            self.head_dim <= 0
+            or int(config.indexer_head_dim) <= 0
+            or int(config.indexer_n_heads) <= 0
+        ):
+            raise ValueError(
+                "QSA head_dim, indexer_head_dim and indexer_n_heads must be positive"
+            )
         self.num_heads = self.total_num_heads // tp_size
         self.num_kv_heads = max(self.total_num_kv_heads // tp_size, 1)
         self.index_head_dim = int(config.indexer_head_dim)
@@ -336,7 +363,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 torch.bfloat16,
                 0,
             ),
-            ("rope_tags", (slots, self.ring_size), torch.int64, -1),
+            # Native low/high bit planes retain the int64 payload width.
+            ("rope_tags", (slots, self.ring_size, 2), torch.int32, -1),
         )
         packing = 4 if self.fp8_kv else 2
         return (

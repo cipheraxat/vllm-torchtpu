@@ -49,8 +49,10 @@ def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
     ):
         return (
             *(torch.empty_like(x) for x in (packed_kv, compressed, ring, tags)),
-            qgate.new_empty((qgate.shape[0], qgate.shape[1] // 2)),
-            positions.new_empty((qgate.shape[0], token_topk + compress_ratio - 1)),
+            qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
         )
 
     def run(
@@ -80,7 +82,6 @@ def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
         k_scale=1.0,
         v_scale=1.0,
     ):
-        planes = torch.stack((tags.to(torch.int32), (tags >> 32).to(torch.int32)), -1)
         packed, c, r, p, output, selected = op(
             qgate,
             key,
@@ -95,7 +96,7 @@ def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
             packed_kv,
             compressed,
             ring,
-            planes,
+            tags,
             starts.to(torch.int32),
             context.to(torch.int32),
             slots.to(torch.int32),
@@ -108,11 +109,10 @@ def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
             k_scale,
             v_scale,
         )
-        for owner, updated in zip((packed_kv, compressed, ring), (packed, c, r)):
+        for owner, updated in zip(
+            (packed_kv, compressed, ring, tags), (packed, c, r, p)
+        ):
             owner.copy_(updated)
-        tags.copy_(
-            (p[..., 1].to(torch.int64) << 32) | (p[..., 0].to(torch.int64) & 0xFFFFFFFF)
-        )
         return output, selected
 
     return run
