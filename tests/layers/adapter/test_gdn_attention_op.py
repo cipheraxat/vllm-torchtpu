@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import re
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -1742,7 +1744,8 @@ def test_pooled_input_preparation_separates_cached_ops(
     )
 
     class PreparedAttention(VllmGatedDeltaNetAttention):
-        def _prepare_pooled_gdn_input(self, mixed_qkv, seq_lens, mesh):
+        @staticmethod
+        def _prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh):
             return mixed_qkv + 1
 
     captured = []
@@ -1826,3 +1829,57 @@ def test_pooled_pcp_wrapper_forwards_state_formats(
     expected_conv = jnp.float32 if conv_dtype == torch.float32 else jnp.bfloat16
     assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
     assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(ssm_dtype)
+
+
+def test_shared_pooled_op_does_not_retain_first_layer(cpu_vllm_config_context):
+    # Real production class/configurations; only the device boundary is mocked.
+    captured = []
+
+    def build(name, function, **kwargs):
+        captured.append(function)
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
+    ):
+        first = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+        torch.nn.Module.__init__(first)
+        first._build_pooled_gdn_op()
+        ref = weakref.ref(first)
+        second = _qwen35_397b_gdn_attn("model.layers.1.linear_attn")
+        second._build_pooled_gdn_op()
+        assert len(captured) == 1
+        different = _qwen38_gdn_attn("model.layers.2.linear_attn")
+        different._build_pooled_gdn_op()
+        assert len(captured) == 2
+        del first
+        gc.collect()
+        assert ref() is None
+        operands = [torch.zeros((1, 1)) for _ in range(12)]
+        operands[5] = None
+        for function in captured:
+            with patch.object(
+                gdn_attention_op,
+                "gdn_attention_pooled_core_tpu",
+                return_value=(operands[3], operands[0]),
+            ) as dispatch:
+                function(*operands)
+            assert dispatch.call_args.args[0] is operands[0]
+
+
+def test_pooled_preparation_rejects_instance_method(cpu_vllm_config_context):
+    class InstancePreparation(VllmGatedDeltaNetAttention):
+        def _prepare_pooled_gdn_input(self, mixed_qkv, seq_lens, mesh):
+            return mixed_qkv
+
+    layer = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+    layer.__class__ = InstancePreparation
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op") as build,
+        pytest.raises(TypeError, match="stateless staticmethod"),
+    ):
+        layer._build_pooled_gdn_op()
+    build.assert_not_called()
