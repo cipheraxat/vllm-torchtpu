@@ -57,6 +57,9 @@ from Q256/KV256 tile unions and SC work from scheduled queries and Q8/KV256
 attention tiles. Coefficients are specific to the supported device and
 geometry; they are not universal hardware constants.
 
+See [Understanding the cost model](sparse_gqa_prefill_cost_model.md) for the
+coefficient sources, named constants, evidence limits, and offline reproduction.
+
 SC is selected when estimated TC cost exceeds estimated SC cost by 2%.
 Static maximum-work bounds, full-query spans, sampled lower bounds and
 coarse occupancy upper bounds can resolve the decision early. Otherwise,
