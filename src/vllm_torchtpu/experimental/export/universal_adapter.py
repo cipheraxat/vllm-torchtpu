@@ -148,6 +148,14 @@ def build_export_config_from_vllm(
     tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1) or 1)
     dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
+    # The model is built and traced on one device (`ensure_model_parallel_initialized
+    # (1, 1)` below), so the graphs are always single-device programs. Stamping a
+    # larger mesh on them would describe per-device shards the graphs do not have.
+    if (tp_size, dp_size, pp_size) != (1, 1, 1):
+        raise NotImplementedError(
+            "export supports only tensor/data/pipeline parallel size 1, got "
+            f"tp={tp_size} dp={dp_size} pp={pp_size}"
+        )
 
     if target_tpu is None:
         with contextlib.suppress(Exception):

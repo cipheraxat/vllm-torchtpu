@@ -417,7 +417,7 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
         cache_config=SimpleNamespace(block_size=8, num_gpu_blocks=16),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=2,
+            tensor_parallel_size=1,
             data_parallel_size=1,
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
@@ -464,8 +464,7 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
 
     with open(os.path.join(out_dir, "serving_checkpoint", "weight.json")) as f:
         wjson = json.load(f)
-    assert wjson["mesh"] == {"mesh_shape": [1, 2], "axis_names": ["dp", "tp"]}
-    assert wjson["lm_head.weight"]["sharding"] == ["tp", None]
+    assert wjson["mesh"] == {"mesh_shape": [1, 1], "axis_names": ["dp", "tp"]}
     assert wjson["lm_head.weight"]["sources"][0]["path"] == "model.safetensors"
     assert wjson["hf_checkpoint_path"] == os.path.abspath(hf_dir)
 
@@ -559,6 +558,28 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
 
     assert "generation_config" not in serving_config
     assert not (out_dir / "generation_config.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("tp", "dp", "pp"), [(2, 1, 1), (4, 1, 1), (1, 2, 1), (1, 1, 2)]
+)
+def test_build_export_config_rejects_multi_device_parallelism(
+    tmp_path: Path, tp: int, dp: int, pp: int
+) -> None:
+    vllm_cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model=str(tmp_path), dtype="bfloat16", max_model_len=128
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            data_parallel_size=dp,
+            pipeline_parallel_size=pp,
+        ),
+    )
+    with pytest.raises(NotImplementedError, match=f"tp={tp} dp={dp} pp={pp}"):
+        universal_adapter.build_export_config_from_vllm(vllm_cfg)
 
 
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
