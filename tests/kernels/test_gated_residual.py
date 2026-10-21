@@ -20,7 +20,7 @@ from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_gated_residual_op
 
 
 @pytest.mark.parametrize(
-    "branches,hidden,tile", [(0, 128, 128), (4, 129, 128), (4, 128, 64)]
+    "branches,hidden,tile", [(0, 128, 128), (4, 129, 128), (4, 128, 0)]
 )
 def test_invalid_geometry(branches, hidden, tile):
     with pytest.raises(ValueError):
@@ -30,10 +30,26 @@ def test_invalid_geometry(branches, hidden, tile):
 TPU = pytest.mark.tpu_test
 
 
+@pytest.fixture(autouse=True)
+def isolated_compile_cache(request):
+    # Each case builds a different op/shape; do not exhaust Dynamo's shared
+    # wrapper recompile limit across independent tests. Repeats inside a case
+    # deliberately keep the same graph and runtime state.
+    if request.node.get_closest_marker("tpu_test"):
+        torch.compiler.reset()
+    yield
+
+
 @TPU
 @pytest.mark.parametrize(
     "branches,hidden,tokens,tile",
-    [(2, 128, 256, 128), (4, 256, 512, 256), (4, 2560, 512, 256), (4, 2560, 8192, 256)],
+    [(c, h, 3 * t, t) for c in (3, 4) for h in (128, 2560) for t in (16, 32, 64, 128)]
+    + [
+        (2, 128, 256, 128),
+        (4, 256, 512, 256),
+        (4, 2560, 512, 256),
+        (4, 2560, 8192, 256),
+    ],
 )
 def test_materialized_operands_match_fp32_reference(branches, hidden, tokens, tile):
     from torch_tpu._internal import compile as tpu_compile
@@ -62,6 +78,10 @@ def test_materialized_operands_match_fp32_reference(branches, hidden, tokens, ti
     actual = run(x.to("tpu"), block.to("tpu"), gates.to("tpu"))
     sync.synchronize([actual], wait=True)
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    repeated = run(x.to("tpu"), block.to("tpu"), gates.to("tpu"))
+    sync.synchronize([repeated], wait=True)
+    assert torch.isfinite(repeated.cpu()).all()
+    torch.testing.assert_close(repeated.cpu(), actual.cpu(), rtol=0, atol=0)
 
 
 @TPU

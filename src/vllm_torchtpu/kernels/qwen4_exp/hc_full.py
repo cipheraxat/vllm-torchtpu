@@ -26,6 +26,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
+    HcHardware,
+    supports_full_mix,
+)
+
 
 def _kernel(
     x_hbm,
@@ -89,6 +94,8 @@ def _kernel(
 
         weight = weight_vm[...].astype(jnp.float32)
 
+        # Bound normalization FP32 work to one32-row branch strip. This does
+        # not bound the later full-width logits/weighted epilogue footprint.
         def normalize_rows(index, carry):
             offset = index * 32
             for branch in range(branches):
@@ -128,6 +135,7 @@ def _kernel(
         def _wait_up():
             up_dma.wait()
 
+        # Match the BF16 up Linear output before NVIDIA's FP32 sigmoid/mix.
         logits = (
             jax.lax.dot_general(
                 gate,
@@ -163,7 +171,11 @@ def _kernel(
         return carry
 
     jax.lax.fori_loop(0, tokens // (2 * token_tile), step_pair, jnp.int32(0))
-    for parity in range(2):
+    tiles = tokens // token_tile
+    if tiles % 2:
+        one_step(tiles - 1, 0)
+    # A one-tile call never started parity1; do not wait its semaphore.
+    for parity in range(min(tiles, 2)):
         pltpu.make_async_copy(
             norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
         ).wait()
@@ -172,8 +184,11 @@ def _kernel(
         ).wait()
 
 
-@functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile"))
-def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
+@functools.partial(
+    jax.jit,
+    static_argnames=("branches", "hidden", "eps", "token_tile", "hardware"),
+)
+def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, hardware=None):
     if branches <= 0 or hidden <= 0 or hidden % 128:
         raise ValueError(
             "HC full mix requires positive branches and 128-aligned hidden"
@@ -185,14 +200,18 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
     if (
         tokens == 0
         or lowrank == 0
-        or tokens % (2 * token_tile)
+        or tokens % token_tile
         or width != branches * hidden
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
         or up.shape != (width, lowrank)
         or any(a.dtype != jnp.bfloat16 for a in (x, weight, down, up))
     ):
-        raise ValueError("HC full mix requires even BF16 token tiles")
+        raise ValueError("HC full mix requires full BF16 token tiles")
+    if hardware is None:
+        hardware = HcHardware.from_tpu_info(pltpu.get_tpu_info())
+    if not supports_full_mix(branches, hidden, lowrank, token_tile, hardware):
+        raise ValueError("HC full mix requires a supported layout and VMEM budget")
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     return pl.pallas_call(
         functools.partial(
@@ -227,6 +246,6 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
             jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 << 20),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=hardware.vmem_bytes),
         name=f"qwen4exp_hc_branchstore32_m{token_tile}",
     )(x, weight, down, up)

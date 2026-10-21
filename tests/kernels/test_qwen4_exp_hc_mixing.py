@@ -59,6 +59,9 @@ def reference(x, weight, down, up, branches=4):
     [
         (127, 4, 128, 128, 128),
         (0, 4, 128, 128, 128),
+        (129, 4, 128, 128, 128),
+        (257, 4, 128, 128, 128),
+        (256, 4, 128, 128, 0),
         (256, 4, 128, 0, 128),
         (256, 4, 128, -128, 128),
         (256, 4, 128, 96, 128),
@@ -108,10 +111,15 @@ def test_hc_torch_fake_shapes(kernel):
 @pytest.mark.parametrize(
     "tokens,branches,hidden,lowrank,tile",
     [
+        (128, 4, 128, 128, 128),
         (256, 4, 128, 128, 128),
+        (384, 4, 128, 128, 128),
         (512, 4, 128, 128, 128),
+        (640, 4, 128, 128, 128),
         (256, 3, 128, 128, 128),
+        (256, 4, 2560, 320, 256),
         (512, 4, 2560, 320, 256),
+        (768, 4, 2560, 320, 256),
     ],
 )
 def test_hc_full_mix_matches_cpu_reference(tokens, branches, hidden, lowrank, tile):
@@ -127,6 +135,11 @@ def test_hc_full_mix_matches_cpu_reference(tokens, branches, hidden, lowrank, ti
     full_mix, full_norm = _full_mix(
         x, weight, down, up, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
     )
+    repeated = _full_mix(
+        x, weight, down, up, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
+    )
+    for first, second in zip((full_mix, full_norm), repeated, strict=True):
+        np.testing.assert_array_equal(np.asarray(first), np.asarray(second))
     # Use the existing HC layer's NRMSE/cosine numerical acceptance contract.
     for actual, expected in [
         (full_norm, expected_norm),
@@ -186,3 +199,47 @@ def test_hc_full_mix_torch_compile():
             np.vdot(a.ravel(), e.ravel()) / (np.linalg.norm(a) * np.linalg.norm(e))
             >= 0.999
         )
+
+
+@pytest.mark.parametrize("operand", range(4))
+def test_hc_rejects_non_bf16_operands(operand):
+    arrays = [jax.ShapeDtypeStruct(a.shape, jnp.bfloat16) for a in inputs()]
+    arrays[operand] = jax.ShapeDtypeStruct(arrays[operand].shape, jnp.float32)
+    with pytest.raises(ValueError, match="BF16"):
+        jax.eval_shape(
+            lambda *a: _full_mix(*a, branches=4, hidden=128, eps=1e-6, token_tile=128),
+            *arrays,
+        )
+
+
+def test_up_projection_fixture_has_a_distinct_bf16_boundary():
+    # BF16 SiLU outputs at down projections-32,-8 with four branches.
+    # Two exact BF16 products give logit0.889404296875, rounded to0.890625.
+    mid = torch.tensor([-0.002685546875, -0.23828125], dtype=torch.float32)
+    up = torch.tensor([-4, -3.6875], dtype=torch.float32)
+    logit = mid @ up
+    assert logit.item() == 0.889404296875
+    assert logit.bfloat16().float().item() == 0.890625
+    rounded = torch.sigmoid(logit.bfloat16().float()).bfloat16()
+    unrounded = torch.sigmoid(logit).bfloat16()
+    assert rounded.item() == 0.7109375
+    assert unrounded.item() == 0.70703125
+
+
+@pytest.mark.tpu_test
+def test_hc_up_projection_rounds_before_fp32_sigmoid():
+    tpu = jax.devices("tpu")[0]
+    host = [
+        np.ones((128, 512), np.float32),
+        np.zeros(512, np.float32),
+        np.zeros((128, 512), np.float32),
+        np.zeros((512, 128), np.float32),
+    ]
+    host[2][0, 0], host[2][1, 0] = -32, -8
+    host[3][:, 0], host[3][:, 1] = -4, -3.6875
+    arrays = [jax.device_put(a, tpu).astype(jnp.bfloat16) for a in host]
+    actual, norm = _full_mix(*arrays, branches=4, hidden=128, eps=1e-6, token_tile=128)
+    np.testing.assert_array_equal(np.asarray(norm, np.float32), 1)
+    # This is intentionally stricter than aggregate NRMSE: removing only the
+    # up-projection BF16 round trip changes every element by one output ULP.
+    np.testing.assert_array_equal(np.asarray(actual, np.float32), 0.7109375)

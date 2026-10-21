@@ -18,17 +18,34 @@ import hashlib
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
+
+
+def current_hc_hardware() -> HcHardware | None:
+    """Read layout only after worker TPU initialization; never claim a device."""
+    module = getattr(torch, "tpu", None)
+    if module is None or not module.is_initialized():
+        return None
+    return HcHardware.from_tpu_info(pltpu.get_tpu_info())
+
+
+def _hardware_tag(hardware: HcHardware | None) -> str:
+    return hashlib.sha1(repr(hardware).encode()).hexdigest()[:12]
 
 
 @functools.cache
-def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
+def build_gated_residual_op(
+    branches: int, hidden: int, token_tile: int, hardware: HcHardware | None = None
+):
     op = pallas.jax_op(
-        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}_v1",
-        gated_residual_fn(branches, hidden, token_tile),
+        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}"
+        f"_l{_hardware_tag(hardware)}_v2",
+        gated_residual_fn(branches, hidden, token_tile, hardware),
     )
 
     @op.register_fake
@@ -39,7 +56,13 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
 
 
 @functools.cache
-def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
+def build_full_mix_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    hardware: HcHardware | None = None,
+):
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
     def core(
@@ -54,10 +77,12 @@ def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
             hidden=hidden,
             eps=eps,
             token_tile=token_tile,
+            hardware=hardware,
         )
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}_v1",
+        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"_l{_hardware_tag(hardware)}_v2",
         core,
     )
 
