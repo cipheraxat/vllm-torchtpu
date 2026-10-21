@@ -111,6 +111,7 @@ class GatedResidual(common_hc.GatedResidual):
             raise RuntimeError("mix was disabled for this hyper-connection")
         if (
             self._prefill_full_op is not None
+            and hyper_input.ndim == 2
             and hyper_input.shape[0] >= self.prefill_full_tile
             and hyper_input.shape[0] % self.prefill_full_tile == 0
             and hyper_input.dtype == torch.bfloat16
@@ -155,6 +156,9 @@ class GatedResidual(common_hc.GatedResidual):
         injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
         if (
             self._prefill_combine_op is not None
+            and hyper_input.ndim == 2
+            and block_output.ndim == 2
+            and hyper_input_normed.ndim == 2
             and hyper_input.shape[0] >= self.prefill_combine_tile
             and hyper_input.shape[0] % self.prefill_combine_tile == 0
             and hyper_input.dtype == torch.bfloat16

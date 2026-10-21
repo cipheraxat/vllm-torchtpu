@@ -343,6 +343,112 @@ def test_hc_full_dispatch_and_fallback(
     assert mixed.dtype == result.dtype == dtype
 
 
+def hc_rank_fixture(monkeypatch):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+    from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
+
+    def forbidden(*args):
+        pytest.fail("rank-ineligible input reached a fused HC callable")
+
+    # Exercise real admission/caller code with CPU-only boundary sentinels.
+    monkeypatch.setattr(
+        vllm_adapter,
+        "current_hc_hardware",
+        lambda: HcHardware("mock-layout", 64 << 20, 128, 16, 8, 256),
+    )
+    monkeypatch.setattr(vllm_adapter, "build_full_mix_op", lambda *args: forbidden)
+    monkeypatch.setattr(
+        vllm_adapter, "build_gated_residual_op", lambda *args: forbidden
+    )
+    module, _, _ = hc_fixture(True, hidden=128, full_tile=128)
+    assert module._prefill_full_op is module._prefill_combine_op is forbidden
+    return module
+
+
+@pytest.mark.parametrize("batch_shape", [(), (128, 2), (128, 1, 2)])
+def test_hc_mix_rank_fallback_matches_reference(batch_shape, monkeypatch):
+    module = hc_rank_fixture(monkeypatch)
+    branches, hidden = module.hc_count, module.hidden_size
+    x = torch.randn(*batch_shape, branches * hidden).bfloat16()
+    streams = x.float().unflatten(-1, (branches, hidden))
+    weight = module.hc_norm.weight.float().reshape(branches, hidden)
+    norm = (
+        (
+            streams
+            * torch.rsqrt(streams.square().mean(-1, keepdim=True) + 1e-6)
+            * (1 + weight)
+        )
+        .bfloat16()
+        .flatten(-2)
+    )
+    down = F.linear(norm, module.input_mix_weight_down.weight)
+    gate = F.linear(
+        F.silu(down.float() / branches).bfloat16(),
+        module.input_mix_weight_up.weight,
+    )
+    expected = (
+        (
+            torch.sigmoid(gate.float()).unflatten(-1, (branches, hidden))
+            * norm.float().unflatten(-1, (branches, hidden))
+        )
+        .mean(-2)
+        .bfloat16()
+    )
+
+    actual, (residual, actual_norm) = module.mix(x)
+    assert residual is x
+    assert torch.isfinite(actual).all() and torch.isfinite(actual_norm).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_norm, norm, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "residual_batch,block_batch,norm_batch",
+    [
+        ((128, 2), (128, 2), (128, 2)),
+        ((128, 1, 2), (128, 1, 2), (128, 1, 2)),
+        ((128, 2), (2,), (2,)),
+        ((128,), (128, 1), (128,)),
+        ((128,), (128,), (128, 1)),
+        ((), (128,), (128,)),
+        ((128,), (), (128,)),
+        ((128,), (128,), ()),
+    ],
+    ids=[
+        "all-rank3",
+        "all-rank4",
+        "residual-rank3",
+        "block-rank3",
+        "norm-rank3",
+        "residual-rank1",
+        "block-rank1",
+        "norm-rank1",
+    ],
+)
+def test_hc_combine_rank_fallback_matches_reference(
+    residual_batch, block_batch, norm_batch, monkeypatch
+):
+    module = hc_rank_fixture(monkeypatch)
+    branches, hidden = module.hc_count, module.hidden_size
+    residual = torch.randn(*residual_batch, branches * hidden).bfloat16()
+    block = torch.randn(*block_batch, hidden).bfloat16()
+    norm = torch.randn(*norm_batch, branches * hidden).bfloat16()
+    injection = F.linear(norm, module.block_inject_weight.weight)
+    gates = 2 * torch.sigmoid(injection.float() / branches)
+    expected = (
+        (
+            residual.float().unflatten(-1, (branches, hidden))
+            + block.float().unsqueeze(-2) * gates.unsqueeze(-1)
+        )
+        .bfloat16()
+        .flatten(-2)
+    )
+
+    actual = module.combine(block, (residual, norm))
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @TPU
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("tokens", [128, 256, 384])
