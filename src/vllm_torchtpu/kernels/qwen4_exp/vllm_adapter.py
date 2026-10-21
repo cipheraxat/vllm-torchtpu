@@ -31,7 +31,14 @@ def current_hc_hardware() -> HcHardware | None:
     module = getattr(torch, "tpu", None)
     if module is None or not module.is_initialized():
         return None
-    return HcHardware.from_tpu_info(pltpu.get_tpu_info())
+    try:
+        info = pltpu.get_tpu_info()
+    except ValueError as error:
+        # Pinned JAX reports an unrecognized device kind with this diagnostic.
+        if not str(error).startswith("Unsupported TPU device kind: "):
+            raise
+        return None
+    return HcHardware.from_tpu_info(info)
 
 
 def _hardware_tag(hardware: HcHardware | None) -> str:
