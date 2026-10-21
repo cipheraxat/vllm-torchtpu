@@ -321,7 +321,7 @@ def test_end_to_end_export_declarative_weights_only(tmp_path) -> None:
     validator.validate_exported_model_dir(out_dir)
 
     assert os.path.isfile(os.path.join(out_dir, "metadata.json"))
-    assert os.path.isfile(os.path.join(out_dir, "config.json"))
+    assert not os.path.exists(os.path.join(out_dir, "config.json"))
     assert os.path.isfile(os.path.join(out_dir, "tokenizer.json"))
     assert os.path.isfile(os.path.join(out_dir, "subgraphs", "abstract_params.mlir"))
     assert os.path.isfile(os.path.join(out_dir, "subgraphs", "forward_bucket8.mlir"))
@@ -538,8 +538,9 @@ def test_companion_files_are_copied_and_declared_in_serving_config(tmp_path) -> 
         "source": {"TokenizerPath": {"path": "tokenizer.json"}}
     }
     assert serving_config["generation_config"] == {"path": "generation_config.json"}
-    for name in ("config.json", "tokenizer.json", "generation_config.json"):
+    for name in ("tokenizer.json", "generation_config.json"):
         assert (out_dir / name).read_text() == (hf_dir / name).read_text()
+    assert not (out_dir / "config.json").exists()
 
 
 def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
@@ -558,51 +559,6 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
 
     assert "generation_config" not in serving_config
     assert not (out_dir / "generation_config.json").exists()
-
-
-def test_hf_overrides_are_applied_to_the_exported_config(tmp_path) -> None:
-    hf_dir = tmp_path / "hf_ckpt"
-    hf_dir.mkdir()
-    (hf_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "num_hidden_layers": 28,
-                "eos_token_id": 2,
-                "text_config": {"num_hidden_layers": 48, "hidden_size": 64},
-            }
-        )
-    )
-    out_dir = tmp_path / "artifact"
-    out_dir.mkdir()
-    cfg = api.TextOnlyLLMExportConfig(
-        model_name="tiny",
-        vocab_size=64,
-        hf_checkpoint_dir=str(hf_dir),
-        hf_overrides={"num_hidden_layers": 4, "text_config": {"num_hidden_layers": 4}},
-    )
-
-    exporter._emit_model_companion_files(cfg, str(out_dir))
-
-    assert json.loads((out_dir / "config.json").read_text()) == {
-        "num_hidden_layers": 4,
-        "eos_token_id": 2,
-        "text_config": {"num_hidden_layers": 4, "hidden_size": 64},
-    }
-
-
-def test_build_export_config_rejects_callable_hf_overrides(tmp_path: Path) -> None:
-    vllm_cfg = SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(tmp_path),
-            dtype="bfloat16",
-            max_model_len=128,
-            hf_overrides=lambda config: config,
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-    )
-    with pytest.raises(ValueError, match="callable hf_overrides"):
-        universal_adapter.build_export_config_from_vllm(vllm_cfg)
 
 
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:

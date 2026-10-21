@@ -479,57 +479,14 @@ def _emit_declarative_weight_json(
         json.dump(weight_map, f, indent=2)
 
 
-def _apply_hf_overrides(
-    config: dict[str, Any], overrides: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Applies `--hf-overrides` to a config dict; dict values update sub-configs."""
-    merged = dict(config)
-    for key, value in overrides.items():
-        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
-            merged[key] = _apply_hf_overrides(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
     """Copies companion files into the artifact and returns the `serving_config` block.
 
-    `config.json` is always written. `tokenizer.json` and `generation_config.json` are
-    copied when the checkpoint has them and declared in `serving_config` by path.
+    `tokenizer.json` and `generation_config.json` are copied when the checkpoint has
+    them and declared in `serving_config` by path; the runtime reads no other file.
     """
-    src_config_copied = False
-    if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
-        src_cfg = os.path.join(cfg.hf_checkpoint_dir, "config.json")
-        if os.path.isfile(src_cfg):
-            dst_cfg = os.path.join(output_dir, "config.json")
-            if cfg.hf_overrides:
-                with open(src_cfg) as f:
-                    config_doc = _apply_hf_overrides(json.load(f), cfg.hf_overrides)
-                with open(dst_cfg, "w") as f:
-                    json.dump(config_doc, f, indent=2)
-                    f.write("\n")
-            else:
-                shutil.copyfile(src_cfg, dst_cfg)
-            src_config_copied = True
-
-    if not src_config_copied:
-        config_doc = {
-            "architectures": list(cfg.architectures),
-            "vocab_size": cfg.vocab_size,
-            "hidden_size": cfg.hidden_size,
-            "num_hidden_layers": cfg.num_layers,
-            "num_attention_heads": cfg.num_q_heads,
-            "num_key_value_heads": cfg.num_kv_heads,
-            "head_dim": cfg.head_dim,
-            "eos_token_id": cfg.eos_token_id,
-            "max_position_embeddings": cfg.max_model_len,
-        }
-        with open(os.path.join(output_dir, "config.json"), "w") as f:
-            json.dump(config_doc, f, indent=2)
-
     serving_config: dict[str, Any] = {
         "bucket_sizes": [int(b) for b in cfg.token_buckets],
         "paged_attention": {
