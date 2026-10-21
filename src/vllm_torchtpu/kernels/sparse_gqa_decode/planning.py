@@ -13,6 +13,7 @@
 # limitations under the License.
 """Derive launch bounds from the unchanged RPA buffers and schedule."""
 
+import dataclasses
 import math
 
 import jax
@@ -21,7 +22,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
-from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import DECODE_BLOCK
+
+from .abi import WORD_BYTES, scalar_prefetch_words
+from .tuned_block_sizes import DEFAULT_POLICY, DecodePolicy
 
 
 def make_config(
@@ -32,9 +35,12 @@ def make_config(
     ratio: int,
     groups: int,
     cache_dtype: jnp.dtype,
+    *,
+    policy: DecodePolicy = DEFAULT_POLICY,
+    info: pltpu.TpuInfo | None = None,
 ) -> configs.RpaConfigs:
     return configs.RpaConfigs(
-        block=DECODE_BLOCK,
+        block=policy.block,
         model=configs.ModelConfigs(
             num_q_heads=heads,
             num_kv_heads=kv_heads,
@@ -52,27 +58,55 @@ def make_config(
             dtype_kv=cache_dtype,
             skip_kv_update=True,
         ),
-        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+        vmem_limit_bytes=(info or pltpu.get_tpu_info()).vmem_capacity_bytes,
         mode=configs.RpaCase.DECODE,
     )
 
 
-def fits_launch(cfgs: configs.RpaConfigs) -> bool:
-    """Check a complete schedule window and conservatively budget VMEM."""
-    info = pltpu.get_tpu_info()
+# Same conservative compiler margins as shared configs.py / wrapper.py.
+SMEM_COMPILER_RESERVE_BYTES = 32 * 1024
+VMEM_USABLE_FRACTION = 0.8
+
+
+@dataclasses.dataclass(frozen=True)
+class ResourceUsage:
+    schedule_bytes: int
+    scalar_bytes: int
+    buffer_bytes: int
+    scratch_bytes: int
+    working_estimate_bytes: int
+    gate_bytes: int
+    worst_steps: int
+    schedule_steps: int
+
+    @property
+    def vmem_estimate_bytes(self) -> int:
+        return (
+            self.buffer_bytes
+            + self.scratch_bytes
+            + self.working_estimate_bytes
+            + self.gate_bytes
+        )
+
+    def fits(self, info: pltpu.TpuInfo) -> bool:
+        return (
+            self.worst_steps <= self.schedule_steps
+            and self.scalar_bytes + self.schedule_bytes
+            <= info.smem_capacity_bytes - SMEM_COMPILER_RESERVE_BYTES
+            and self.vmem_estimate_bytes
+            <= info.vmem_capacity_bytes * VMEM_USABLE_FRACTION
+        )
+
+
+def resource_usage(cfgs: configs.RpaConfigs) -> ResourceUsage:
+    """Exact allocation sizes, separate from working-set/headroom estimates."""
     n = cfgs.serve.num_seqs
     tiles = pl.cdiv(cfgs.serve.pages_per_seq * cfgs.serve.page_size, cfgs.bkv_sz)
-    if pl.cdiv(n * tiles, cfgs.batch_size) > cfgs.max_steps_ub:
-        return False
+    worst_steps = pl.cdiv(n * tiles, cfgs.batch_size)
     metadata = schedule.BaseMetadataComputer.get_rpa_schedule(cfgs)
     schedule_bytes = sum(x.size * x.dtype.itemsize for x in jax.tree.leaves(metadata))
     # Actual scalar prefetch: cu_q_lens, offsets, q_lens and virtual pages.
-    scalar_bytes = (3 * n + 1 + cfgs.serve.num_page_indices) * 4
-    # Match RpaConfigs.max_steps_ub's compiler reserve. Its minimum one vector
-    # of steps can exceed SMEM for small virtual pages, so check actual bytes.
-    if scalar_bytes + schedule_bytes > info.smem_capacity_bytes - 32 * 1024:
-        return False
-
+    scalar_bytes = scalar_prefetch_words(n, cfgs.serve.num_page_indices) * WORD_BYTES
     q_bytes = math.prod(cfgs.q_vmem_shape) * cfgs.serve.dtype_q.itemsize
     kv_bytes = math.prod(cfgs.kv_vmem_shape) * cfgs.serve.dtype_kv.itemsize
     buffers = (
@@ -86,14 +120,73 @@ def fits_launch(cfgs: configs.RpaConfigs) -> bool:
     # plus the fused entry's resident BF16 gate and FP32 gate intermediates.
     heads, dim = cfgs.model.num_q_heads, cfgs.aligned_q_head_dim
     working = cfgs.batch_size * (
-        heads * dim * 4
+        heads * dim * cfgs.serve.dtype_q.itemsize
         + cfgs.bkv_sz * cfgs.model.num_kv_heads * dim * cfgs.serve.dtype_kv.itemsize
-        + cfgs.bkv_sz * heads * 4
-        + heads * dim * 4
+        + cfgs.bkv_sz * heads * cfgs.serve.dtype_out.itemsize
+        + heads * dim * cfgs.serve.dtype_q.itemsize
     )
     gate = n * heads * dim * jnp.dtype(jnp.bfloat16).itemsize
     # Keep the existing RPA planner's 20% headroom for compiler layout/temps.
-    return buffers + scratches + working + gate <= cfgs.vmem_limit_bytes * 0.8
+    return ResourceUsage(
+        schedule_bytes=schedule_bytes,
+        scalar_bytes=scalar_bytes,
+        buffer_bytes=buffers,
+        scratch_bytes=scratches,
+        working_estimate_bytes=working,
+        gate_bytes=gate,
+        worst_steps=worst_steps,
+        schedule_steps=cfgs.max_steps_ub,
+    )
+
+
+def fits_launch(cfgs: configs.RpaConfigs) -> bool:
+    return resource_usage(cfgs).fits(pltpu.get_tpu_info())
+
+
+def _config_for_batch(cfgs: configs.RpaConfigs, batch: int) -> configs.RpaConfigs:
+    return dataclasses.replace(
+        cfgs,
+        serve=dataclasses.replace(
+            cfgs.serve,
+            num_seqs=batch,
+            total_q_tokens=batch,
+            num_page_indices=batch * cfgs.serve.pages_per_seq,
+        ),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class DecodeLaunch:
+    policy: DecodePolicy
+    config: configs.RpaConfigs
+    resources: ResourceUsage
+
+    @property
+    def chunk_queries(self) -> int:
+        return self.config.serve.num_seqs
+
+    def config_for_batch(self, batch: int) -> configs.RpaConfigs:
+        if batch > self.chunk_queries:
+            raise ValueError("Chunk exceeds planned query capacity")
+        if batch == self.chunk_queries:
+            return self.config
+        # Rebuild actual scalar/page shapes, not the power-of-two upper bound.
+        return _config_for_batch(self.config, batch)
+
+
+def _plan_launch(
+    cfgs: configs.RpaConfigs,
+    info: pltpu.TpuInfo,
+    policy: DecodePolicy = DEFAULT_POLICY,
+) -> DecodeLaunch | None:
+    size = cfgs.serve.num_seqs
+    while size:
+        cfgs = _config_for_batch(cfgs, size)
+        resources = resource_usage(cfgs)
+        if resources.fits(info):
+            return DecodeLaunch(policy=policy, config=cfgs, resources=resources)
+        size //= 2
+    return None
 
 
 def query_batch_size(
@@ -106,10 +199,10 @@ def query_batch_size(
     cache_dtype: jnp.dtype,
 ) -> int:
     """Largest power-of-two launch fitting resources; zero means use RPA."""
-    size = 1 << (batch - 1).bit_length()
-    while size:
-        cfgs = make_config(size, heads, dim, kv_heads, ratio, groups, cache_dtype)
-        if fits_launch(cfgs):
-            return size
-        size //= 2
-    return 0
+    info = pltpu.get_tpu_info()
+    capacity = 1 << (batch - 1).bit_length()
+    cfgs = make_config(
+        capacity, heads, dim, kv_heads, ratio, groups, cache_dtype, info=info
+    )
+    launch = _plan_launch(cfgs, info)
+    return launch.chunk_queries if launch else 0

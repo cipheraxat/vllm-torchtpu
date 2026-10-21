@@ -31,18 +31,22 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     kernel,
     pipeline,
     schedule,
-    utils,
 )
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
+from .abi import output_aliases, schedule_copy_size
+from .tuned_block_sizes import DecodePolicy
 
-def _load_schedule(source, target, semaphore, steps, cfgs):
-    """Copy the live prefix, respecting the RPA schedule's DMA alignment."""
+
+def _load_schedule(source, target, semaphore, steps, cfgs, policy):
+    """Copy a zero-start live prefix; start/wait share the exact same slice."""
     copies = []
     for src, dst in zip(jax.tree.leaves(source), jax.tree.leaves(target)):
         if jax.typeof(src).memory_space == pltpu.HBM:
             words_per_step = dst.size // cfgs.max_steps_ub
-            size = jnp.minimum(utils.align_to(words_per_step * steps, 1024), dst.size)
+            size = schedule_copy_size(
+                words_per_step * steps, dst.size, policy.schedule_copy_words
+            )
             copy = pltpu.make_async_copy(
                 src.at[pl.ds(0, size)], dst.at[pl.ds(0, size)], semaphore.at[0]
             )
@@ -79,8 +83,9 @@ def _gate_output(output, gate, metadata, step, cfgs):
 
 
 def decode_kernel(
+    *,
     cu_q_lens: jax.Array,
-    offsets: jax.Array,
+    compressed_query_offsets: jax.Array,
     q_lens: jax.Array,
     pages: jax.Array,
     metadata: schedule.RpaSchedule,
@@ -88,8 +93,8 @@ def decode_kernel(
     unused_new_kv: jax.Array,
     cache: jax.Array,
     gate: jax.Array,
-    *,
     cfgs: configs.RpaConfigs,
+    policy: DecodePolicy,
 ) -> tuple[jax.Array, jax.Array]:
     """Run one bounded, read-only decode schedule; output aliases query/cache."""
     if (
@@ -149,7 +154,9 @@ def decode_kernel(
 
             @pl.when(steps > 0)
             def attend():
-                _load_schedule(metadata_ref, schedule_ref, semaphore, steps, cfgs)
+                _load_schedule(
+                    metadata_ref, schedule_ref, semaphore, steps, cfgs, policy
+                )
 
                 q_bound = q_alloc.bind(src_ref=(query_ref, schedule_ref))
                 o_bound = o_alloc.bind(dst_ref=(out_ref, schedule_ref))
@@ -183,16 +190,19 @@ def decode_kernel(
                         start_next_fetch=start_next_fetch,
                         start_kv_writeback=start_kv_writeback,
                     )
+                    # LAST_TILE owns final rounding/gating before the pipeline
+                    # issues output DMA. Scratch carry is reset inside RPA body.
                     _gate_output(output, gate_ref, schedule_ref, step, cfgs)
 
+                # Three input slots prefetch N+2; two output slots wait N-2.
+                # Keep that scheduling visible, and keep gating before O DMA.
                 pipeline.run_manual_triple_buffer(
                     steps, compute, q_bound, o_bound, kv_bound
                 )
 
         execute()
 
-    scalars = (cu_q_lens, offsets, q_lens, pages)
-    query_index = len(scalars) + len(jax.tree.leaves(metadata))
+    scalars = (cu_q_lens, compressed_query_offsets, q_lens, pages)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
         run,
@@ -208,7 +218,7 @@ def decode_kernel(
             ],
             out_specs=[hbm, hbm],
         ),
-        input_output_aliases={query_index: 0, query_index + 2: 1},
+        input_output_aliases=output_aliases(scalars, metadata),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=cfgs.vmem_limit_bytes,
             disable_bounds_checks=True,

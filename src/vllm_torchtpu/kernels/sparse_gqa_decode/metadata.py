@@ -26,7 +26,11 @@ def virtual_page_metadata(
     ratio: int = 4,
     page_size: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
-    """Map selected logical groups to physical micro-pages; no KV gathering."""
+    """Map groups of ratio tokens through physical pages of page_size tokens.
+
+    page_size comes from the original cache shape; the returned RPA page has
+    ratio tokens. Valid group/page IDs and bounded lengths are caller contracts.
+    """
     batch, budget = blocks.shape
     complete = lengths // ratio
     count = jnp.minimum(complete, budget)

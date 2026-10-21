@@ -25,27 +25,15 @@ from vllm_torchtpu.kernels.sparse_gqa_decode import schedule
 from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
 from vllm_torchtpu.kernels.sparse_gqa_decode.fused_kernel import decode_kernel
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metadata
-from vllm_torchtpu.kernels.sparse_gqa_decode.planning import (
-    make_config,
-    query_batch_size,
-)
+from vllm_torchtpu.kernels.sparse_gqa_decode.planning import DecodeLaunch
 
 
-def _attend(
-    q, gate, blocks, lengths, table, cache, *, kv_heads, ratio, k_scale, v_scale
-):
+def _attend(q, gate, blocks, lengths, table, cache, *, launch, k_scale, v_scale):
     batch, heads, dim = q.shape
+    cfgs = launch.config_for_batch(batch)
+    kv_heads, ratio = cfgs.model.num_kv_heads, cfgs.serve.page_size
     pages, kv_lens = virtual_page_metadata(
         blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
-    )
-    cfgs = make_config(
-        batch,
-        heads,
-        dim,
-        kv_heads,
-        ratio,
-        blocks.shape[1],
-        cache.dtype,
     )
     cfgs = dataclasses.replace(
         cfgs, serve=dataclasses.replace(cfgs.serve, scale_k=k_scale, scale_v=v_scale)
@@ -61,20 +49,46 @@ def _attend(
     q_lens = (kv_lens > 0).astype(jnp.int32)
     metadata = schedule.generate(cu_q_lens, kv_lens, cfgs)
     out, next_cache = decode_kernel(
-        cu_q_lens,
-        kv_lens - q_lens,
-        q_lens,
-        pages.reshape(-1),
-        metadata,
-        query,
-        unused_new_kv,
-        virtual_cache,
-        gate,
+        cu_q_lens=cu_q_lens,
+        compressed_query_offsets=kv_lens - q_lens,
+        q_lens=q_lens,
+        pages=pages.reshape(-1),
+        metadata=metadata,
+        query=query,
+        unused_new_kv=unused_new_kv,
+        cache=virtual_cache,
+        gate=gate,
         cfgs=cfgs,
+        policy=launch.policy,
     )
     out = bf16(out.swapaxes(0, 1).reshape(q.shape))
     out = jnp.where((lengths > 0)[:, None, None], out, 0)
     return out, next_cache.reshape(cache.shape)
+
+
+def execute_decode(
+    q: jax.Array,
+    gate: jax.Array,
+    blocks: jax.Array,
+    lengths: jax.Array,
+    table: jax.Array,
+    cache: jax.Array,
+    *,
+    launch: DecodeLaunch,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[jax.Array, jax.Array]:
+    attend = functools.partial(_attend, launch=launch, k_scale=k_scale, v_scale=v_scale)
+    return attend_in_chunks(
+        attend,
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        batch_size=launch.chunk_queries,
+    )
 
 
 def qsa_decode_attention(
@@ -90,19 +104,18 @@ def qsa_decode_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> tuple[jax.Array, jax.Array]:
-    attend = functools.partial(
-        _attend, kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale
-    )
-    batch_size = query_batch_size(
-        q.shape[0],
-        q.shape[1],
-        q.shape[2],
-        kv_heads,
-        ratio,
-        blocks.shape[1],
-        cache.dtype,
-    )
-    assert batch_size > 0
-    return attend_in_chunks(
-        attend, q, gate, blocks, lengths, table, cache, batch_size=batch_size
+    """Retain the existing module entry; internal dispatch uses execute_decode."""
+    from . import qsa_decode_attention as checked_decode
+
+    return checked_decode(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )

@@ -288,7 +288,6 @@ def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
 
 @pytest.mark.parametrize("supported", [False, True])
 def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
-    from vllm_torchtpu.kernels import sparse_gqa_decode
     from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
     monkeypatch.setattr(
@@ -310,7 +309,9 @@ def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
         used.append("rpa")
         return inputs[0], inputs[5]
 
-    monkeypatch.setattr(sparse_gqa_decode, "qsa_decode_attention", fused)
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    monkeypatch.setattr(decode, "execute_decode", fused)
     monkeypatch.setattr(qsa_rpa, "rpa_attention", baseline)
     out, cache = qsa_rpa.qsa_attention(
         *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4

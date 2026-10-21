@@ -18,11 +18,12 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from .planning import query_batch_size
-from .tuned_block_sizes import DECODE_BLOCK
+from .abi import RPA_WAIT_ROW_WORDS
+from .planning import DecodeLaunch, _plan_launch, make_config
+from .tuned_block_sizes import DEFAULT_POLICY, DecodePolicy
 
 
-def is_supported_by_fused_decode(
+def plan_decode(
     q: jax.Array,
     gate: jax.Array,
     blocks: jax.Array,
@@ -34,7 +35,8 @@ def is_supported_by_fused_decode(
     ratio: int,
     k_scale: float,
     v_scale: float,
-) -> bool:
+    policy: DecodePolicy = DEFAULT_POLICY,
+) -> DecodeLaunch | None:
     """Static eligibility; callers supply valid per-query selected groups."""
     if (
         q.ndim != 3
@@ -47,7 +49,8 @@ def is_supported_by_fused_decode(
         or q.dtype != jnp.bfloat16
         or gate.dtype != jnp.bfloat16
         or ratio <= 0
-        or DECODE_BLOCK.bkv_sz % ratio != 0
+        or policy.bkv_tokens <= 0
+        or policy.bkv_tokens % ratio != 0
         or blocks.ndim != 2
         or blocks.shape[0] != len(q)
         or blocks.shape[1] <= 0
@@ -68,11 +71,20 @@ def is_supported_by_fused_decode(
         or k_scale <= 0
         or v_scale <= 0
     ):
-        return False
+        return None
     info = pltpu.get_tpu_info()
-    if info.chip_version != pltpu.ChipVersion.TPU_7X:
-        return False
-    packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
+    if (
+        info.chip_version != pltpu.ChipVersion.TPU_7X
+        or info.num_lanes != RPA_WAIT_ROW_WORDS
+        or policy.bkv_tokens % info.num_lanes
+        or not 0 < policy.pipeline_lanes <= info.num_lanes
+        or policy.schedule_copy_words <= 0
+        or policy.schedule_copy_words % info.num_lanes
+    ):
+        return None
+    packing = jax.dtypes.itemsize_bits(jnp.uint32) // jax.dtypes.itemsize_bits(
+        cache.dtype
+    )
     # Physical token offsets, logical context lengths and flattened page-table
     # lookups use int32. These limits follow the indexing contract, not a
     # benchmark's largest batch or context.
@@ -86,16 +98,47 @@ def is_supported_by_fused_decode(
         or (table.shape[1] - 1) * cache.shape[1] >= index_max
         or table.size > index_max
     ):
-        return False
+        return None
+    cfgs = make_config(
+        1 << (q.shape[0] - 1).bit_length(),
+        q.shape[1],
+        q.shape[2],
+        kv_heads,
+        ratio,
+        blocks.shape[1],
+        cache.dtype,
+        info=info,
+        policy=policy,
+    )
+    return _plan_launch(cfgs, info, policy)
+
+
+def is_supported_by_fused_decode(
+    q: jax.Array,
+    gate: jax.Array,
+    blocks: jax.Array,
+    lengths: jax.Array,
+    table: jax.Array,
+    cache: jax.Array,
+    *,
+    kv_heads: int,
+    ratio: int,
+    k_scale: float,
+    v_scale: float,
+) -> bool:
+    """Shape/static envelope only; callers guarantee metadata contents valid."""
     return (
-        query_batch_size(
-            q.shape[0],
-            q.shape[1],
-            q.shape[2],
-            kv_heads,
-            ratio,
-            blocks.shape[1],
-            cache.dtype,
+        plan_decode(
+            q,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
-        > 0
+        is not None
     )

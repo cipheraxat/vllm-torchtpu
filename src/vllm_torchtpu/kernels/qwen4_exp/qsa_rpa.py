@@ -206,12 +206,10 @@ def qsa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-    from vllm_torchtpu.kernels.sparse_gqa_decode import (
-        is_supported_by_fused_decode,
-        qsa_decode_attention,
-    )
+    from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
+    from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
 
-    if is_supported_by_fused_decode(
+    launch = plan_decode(
         query,
         gate,
         blocks,
@@ -222,16 +220,16 @@ def qsa_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
-    ):
-        return qsa_decode_attention(
+    )
+    if launch is not None:
+        return execute_decode(
             query,
             gate,
             blocks,
             lengths,
             table,
             cache,
-            kv_heads=kv_heads,
-            ratio=ratio,
+            launch=launch,
             k_scale=k_scale,
             v_scale=v_scale,
         )

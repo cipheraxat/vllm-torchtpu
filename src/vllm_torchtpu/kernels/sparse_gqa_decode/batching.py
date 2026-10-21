@@ -19,12 +19,20 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
+# Inherited RPA page-table/code-size policies, not hardware maxima.
+RPA_MAX_QUERY_CHUNK = 64
+RPA_PAGE_TABLE_BUDGET_BYTES = 160 * 1024
+MAX_SCAN_UNROLL = 4
+
 
 def rpa_query_batch_size(page_columns: int) -> int:
     # Preserve QSA's existing SMEM budget: the 128-step RPA schedule occupies
     # about 815 KiB on TPU7x. Reserve 160 KiB for page indices and cap each
     # launch at 64 queries, which needs at most 72 decode steps at this budget.
-    max_queries = min(64, (160 * 1024) // (4 * page_columns))
+    max_queries = min(
+        RPA_MAX_QUERY_CHUNK,
+        RPA_PAGE_TABLE_BUDGET_BYTES // (jnp.dtype(jnp.int32).itemsize * page_columns),
+    )
     return 1 << (max_queries.bit_length() - 1)
 
 
@@ -61,6 +69,6 @@ def attend_in_chunks(
         step,
         cache,
         tuple(map(split, (q, gate, blocks, lengths, table))),
-        unroll=min(num_chunks, 4),
+        unroll=min(num_chunks, MAX_SCAN_UNROLL),
     )
     return output.reshape(-1, *q.shape[1:])[: len(q)], cache

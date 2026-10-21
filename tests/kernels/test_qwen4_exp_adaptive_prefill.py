@@ -21,12 +21,12 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels import sparse_gqa_decode
 from vllm_torchtpu.kernels.qwen4_exp import (
     block_sparse_gqa_prefill,
     prefill_tiles,
     qsa_rpa,
 )
+from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive
 
 
@@ -85,8 +85,8 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
     )
     monkeypatch.setattr(qsa_rpa, "rpa_attention", functools.partial(capture, "decode"))
     monkeypatch.setattr(
-        sparse_gqa_decode,
-        "qsa_decode_attention",
+        decode,
+        "execute_decode",
         functools.partial(capture, "fused_decode"),
     )
     scale = 2.0 if case == "scale" else 1.0

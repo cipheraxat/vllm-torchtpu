@@ -19,10 +19,13 @@ index selection and cache updates are outside the measured attention boundary.
 
 import argparse
 import functools
+import hashlib
 import importlib.metadata
 import json
 import math
 import statistics
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -31,6 +34,56 @@ import jax.numpy as jnp
 import numpy as np
 
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention, rpa_attention
+
+
+def provenance(devices):
+    """Record loaded source and device identity outside the timing boundary."""
+    root = Path(__file__).resolve().parents[1]
+
+    def git(*args):
+        try:
+            return subprocess.check_output(
+                ["git", *args], cwd=root, text=True, stderr=subprocess.PIPE
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    sources = {}
+    for name, module in sorted(sys.modules.items()):
+        if name.startswith("vllm_torchtpu.kernels.") and getattr(
+            module, "__file__", None
+        ):
+            path = Path(module.__file__).resolve()
+            sources[name] = dict(
+                path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+            )
+    return dict(
+        argv=sys.argv,
+        git_head=git("rev-parse", "HEAD"),
+        git_status=git("status", "--porcelain"),
+        script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        loaded_sources=sources,
+        devices=[
+            dict(
+                id=d.id,
+                kind=d.device_kind,
+                coords=getattr(d, "coords", None),
+                core_on_chip=getattr(d, "core_on_chip", None),
+                process_index=d.process_index,
+            )
+            for d in devices
+        ],
+        jax_config={
+            name: str(jax.config.values[name])
+            for name in (
+                "jax_enable_x64",
+                "jax_platforms",
+                "jax_default_matmul_precision",
+            )
+        },
+        warmups_per_arm=3,
+        timing_boundary="host perf_counter_ns before call through block_until_ready",
+    )
 
 
 def make_case(
@@ -91,13 +144,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    devices = jax.devices()
     report = dict(
-        device=str(jax.devices()[0]),
+        schema_version=2,
+        device=str(devices[0]),
+        provenance=provenance(devices),
         versions={
             k: importlib.metadata.version(k) for k in ("jax", "jaxlib", "libtpu")
         },
         cases=[],
     )
+    (args.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
     for batch in args.batches:
         for context in args.contexts:
             name = f"b{batch}-l{context}"
@@ -142,6 +199,7 @@ def main():
                 for _ in range(3):
                     outputs[label], cache = jax.block_until_ready(exe(*owned[label]))
                     owned[label][-1] = cache
+            compiled_provenance = provenance(devices)
             expected = np.asarray(outputs["rpa"], np.float32)
             actual = np.asarray(outputs["fused"], np.float32)
             assert np.isfinite(actual).all() and np.isfinite(expected).all()
@@ -179,6 +237,7 @@ def main():
                 relative_l2=rel,
                 max_abs=float(np.max(np.abs(actual - expected))),
                 memory=memory,
+                compiled_provenance=compiled_provenance,
             )
             report["cases"].append(row)
             (args.output / "results.json").write_text(
