@@ -560,6 +560,51 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     assert not (out_dir / "generation_config.json").exists()
 
 
+def test_hf_overrides_are_applied_to_the_exported_config(tmp_path) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": 28,
+                "eos_token_id": 2,
+                "text_config": {"num_hidden_layers": 48, "hidden_size": 64},
+            }
+        )
+    )
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        vocab_size=64,
+        hf_checkpoint_dir=str(hf_dir),
+        hf_overrides={"num_hidden_layers": 4, "text_config": {"num_hidden_layers": 4}},
+    )
+
+    exporter._emit_model_companion_files(cfg, str(out_dir))
+
+    assert json.loads((out_dir / "config.json").read_text()) == {
+        "num_hidden_layers": 4,
+        "eos_token_id": 2,
+        "text_config": {"num_hidden_layers": 4, "hidden_size": 64},
+    }
+
+
+def test_build_export_config_rejects_callable_hf_overrides(tmp_path: Path) -> None:
+    vllm_cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model=str(tmp_path),
+            dtype="bfloat16",
+            max_model_len=128,
+            hf_overrides=lambda config: config,
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    )
+    with pytest.raises(ValueError, match="callable hf_overrides"):
+        universal_adapter.build_export_config_from_vllm(vllm_cfg)
+
+
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshots" / "main"
     snapshot.mkdir(parents=True)

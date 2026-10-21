@@ -479,6 +479,19 @@ def _emit_declarative_weight_json(
         json.dump(weight_map, f, indent=2)
 
 
+def _apply_hf_overrides(
+    config: dict[str, Any], overrides: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Applies `--hf-overrides` to a config dict; dict values update sub-configs."""
+    merged = dict(config)
+    for key, value in overrides.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
+            merged[key] = _apply_hf_overrides(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
@@ -491,7 +504,15 @@ def _emit_model_companion_files(
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
         src_cfg = os.path.join(cfg.hf_checkpoint_dir, "config.json")
         if os.path.isfile(src_cfg):
-            shutil.copyfile(src_cfg, os.path.join(output_dir, "config.json"))
+            dst_cfg = os.path.join(output_dir, "config.json")
+            if cfg.hf_overrides:
+                with open(src_cfg) as f:
+                    config_doc = _apply_hf_overrides(json.load(f), cfg.hf_overrides)
+                with open(dst_cfg, "w") as f:
+                    json.dump(config_doc, f, indent=2)
+                    f.write("\n")
+            else:
+                shutil.copyfile(src_cfg, dst_cfg)
             src_config_copied = True
 
     if not src_config_copied:

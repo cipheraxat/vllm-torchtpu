@@ -82,6 +82,8 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
             (valid only for vocab_size <= 256 in small test models).
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
             containing config.json, tokenizer.json, and safetensors headers.
+        hf_overrides: Overrides applied to the checkpoint's config.json (as with
+            vLLM's `--hf-overrides`), so the written config matches the graphs.
     """
 
     vocab_size: int = 151936
@@ -101,6 +103,7 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     architectures: tuple[str, ...] = ("Qwen3ForCausalLM",)
     emit_byte_tokenizer: bool = False
     hf_checkpoint_dir: str | None = None
+    hf_overrides: Mapping[str, Any] | None = None
     uses_mrope: bool = False
 
     def __post_init__(self) -> None:

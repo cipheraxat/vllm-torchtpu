@@ -141,6 +141,12 @@ def build_export_config_from_vllm(
         or getattr(model_cfg, "model", None)
         or _extract_hf_field(hf_cfg, "_name_or_path", "model_type", default="model")
     )
+    hf_overrides = getattr(model_cfg, "hf_overrides", None)
+    if callable(hf_overrides):
+        raise ValueError(
+            "a callable hf_overrides cannot be applied to the exported config.json; "
+            "pass the overrides as a dict"
+        )
     resolved_hf_dir = resolve_hf_checkpoint_dir(
         hf_checkpoint_dir or getattr(model_cfg, "model", None)
     )
@@ -285,6 +291,7 @@ def build_export_config_from_vllm(
         architectures=architectures,
         emit_byte_tokenizer=False,
         hf_checkpoint_dir=str(resolved_hf_dir) if resolved_hf_dir else None,
+        hf_overrides=dict(hf_overrides) if hf_overrides else None,
         uses_mrope=uses_mrope,
     )
 
