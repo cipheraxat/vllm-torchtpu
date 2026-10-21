@@ -30,9 +30,11 @@ import math
 import platform
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -47,7 +49,7 @@ from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
     adaptive_prefill,
     is_supported_by_adaptive_prefill,
 )
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 
 BASELINE_COMMIT = "d3b574ec1f560ec45bb71c76a9258b8af9084d2a"
 
@@ -289,17 +291,20 @@ def main() -> None:
         "original_tiles",
         baseline / "src/vllm_torchtpu/kernels/qwen4_exp/prefill_tiles.py",
     )
-    old_adaptive = load(
-        "original_adaptive",
-        baseline / "src/vllm_torchtpu/kernels/sparse_gqa_prefill/adaptive.py",
-    )
-    old_adaptive.candidate = old_tc
     old_cost = load(
         "original_cost",
         baseline / "src/vllm_torchtpu/kernels/sparse_gqa_prefill/cost_model.py",
     )
-    old_adaptive.select_sc = old_cost.select_sc
-    old_adaptive.tc_always_wins = old_cost.tc_always_wins
+    # The pinned baseline imports selectors from the original cost_model module.
+    with patch.dict(
+        sys.modules,
+        {"vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model": old_cost},
+    ):
+        old_adaptive = load(
+            "original_adaptive",
+            baseline / "src/vllm_torchtpu/kernels/sparse_gqa_prefill/adaptive.py",
+        )
+    old_adaptive.candidate = old_tc
     indices = [i for i, c in enumerate(CASES) if a.cases is None or c[0] in a.cases]
     paths = [
         "qwen4_exp/block_sparse_gqa_prefill.py",
@@ -317,6 +322,9 @@ def main() -> None:
         }
         for arm, root in [("prior", baseline), ("review", repo)]
     }
+    source["review"]["sparse_gqa_prefill/selector.py"] = hashlib.sha256(
+        (repo / "src/vllm_torchtpu/kernels/sparse_gqa_prefill/selector.py").read_bytes()
+    ).hexdigest()
     provenance = dict(
         baseline_head=actual,
         candidate_head=subprocess.check_output(

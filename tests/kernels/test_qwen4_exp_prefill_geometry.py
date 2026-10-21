@@ -262,7 +262,7 @@ def test_other_compression_ratio_uses_general_tc():
 @pytest.mark.parametrize("fp8", [False, True])
 def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8):
     from tests.kernels.test_sparse_gqa_adaptive_prefill import _make_inputs
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 
     args = list(_make_inputs(512, 131072, fp8, True))
     # Distinct request page permutations in one shared pool. An unused NaN
@@ -299,7 +299,7 @@ def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 def test_live_tail_smaller_than_sc_microchunk(fp8):
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
     from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import SC_CHUNK_SIZE
 
     args, _ = inputs(17, 24, 2, 256, fp8)

@@ -30,7 +30,7 @@ from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
     adaptive_prefill,
     is_supported_by_adaptive_prefill,
 )
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 
 
 def _abstract_args(dtype=jnp.bfloat16):

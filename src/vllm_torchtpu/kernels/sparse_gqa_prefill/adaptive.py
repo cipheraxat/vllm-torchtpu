@@ -28,11 +28,11 @@ from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as candidate
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import (
-    select_sc,
-    tc_always_wins,
-)
 from vllm_torchtpu.kernels.sparse_gqa_prefill.grouped import sc_grouped_attention
+from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import (
+    select_sc,
+    tc_selected_by_static_bound,
+)
 from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import SC_CHUNK_SIZE
 
 
@@ -78,13 +78,24 @@ def adaptive_prefill(
     full_chunks, tail = divmod(len(q), 8192)
     num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
     choices = None
-    if full_chunks and not tc_always_wins(
+    if full_chunks and not tc_selected_by_static_bound(
         queries=8192, num_tiles=num_tiles, dtype=cache.dtype
     ):
+
+        def select_chunk(data):
+            chunk_index, chunk_blocks, chunk_lengths = data
+            return _select_sc_for_chunk(
+                chunk_blocks,
+                chunk_lengths,
+                starts,
+                chunk_index * 8192,
+                8192,
+                num_tiles,
+                cache.dtype,
+            )
+
         choices = lax.map(
-            lambda data: _choose(
-                data[1], data[2], starts, data[0] * 8192, 8192, num_tiles, cache.dtype
-            ),
+            select_chunk,
             (
                 jnp.arange(full_chunks),
                 blocks[: full_chunks * 8192].reshape(full_chunks, 8192, -1),
@@ -106,7 +117,9 @@ def adaptive_prefill(
         padded = (tail + 255) // 256 * 256
         ids = jnp.pad(blocks[offset:], ((0, padded - tail), (0, 0)), constant_values=-1)
         ls = jnp.pad(lengths[offset:], (0, padded - tail))
-        choose = _choose(ids, ls, starts, offset, tail, num_tiles, cache.dtype)
+        choose = _select_sc_for_chunk(
+            ids, ls, starts, offset, tail, num_tiles, cache.dtype
+        )
         return _write_chunk(
             arrays, cache, starts, output, offset, tail, choose, tail=True
         )
@@ -129,7 +142,7 @@ def adaptive_prefill(
 
 
 def _direct_tc(query, gate, blocks, lengths, table, cache):
-    return candidate.block_sparse_gqa_attention(
+    output, _ = candidate.block_sparse_gqa_attention(
         query,
         gate,
         blocks,
@@ -141,7 +154,8 @@ def _direct_tc(query, gate, blocks, lengths, table, cache):
         ratio=4,
         query_block=256,
         kv_tile=256,
-    )[0]
+    )
+    return output
 
 
 def _ragged_tc_write(arrays, cache, starts, output, offset, size):
@@ -156,7 +170,7 @@ def _ragged_tc_write(arrays, cache, starts, output, offset, size):
             start = jnp.minimum(first, len(output) - rows)
             indices = start + jnp.arange(rows, dtype=jnp.int32)
             valid = (indices >= first) & (indices < offset + local[req + 1])
-            ys = tuple(
+            tile_query, tile_gate, tile_blocks, tile_lengths = tuple(
                 jnp.pad(
                     jnp.where(
                         valid.reshape((rows,) + (1,) * (x.ndim - 1)),
@@ -171,8 +185,11 @@ def _ragged_tc_write(arrays, cache, starts, output, offset, size):
             # A clipped final tile can begin before this request. All its
             # live queries still use this request's table, including when
             # the first query lane is masked.
-            table = jnp.broadcast_to(arrays[4][first], (256, arrays[4].shape[1]))
-            result = _direct_tc(ys[0], ys[1], ys[2], ys[3], table, cache)[:rows]
+            _, _, _, _, page_table = arrays
+            tile_table = jnp.broadcast_to(page_table[first], (256, page_table.shape[1]))
+            result = _direct_tc(
+                tile_query, tile_gate, tile_blocks, tile_lengths, tile_table, cache
+            )[:rows]
             old = lax.dynamic_slice_in_dim(output, start, rows)
             result = jnp.where(valid[:, None, None], result, old)
             return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
@@ -195,7 +212,7 @@ def _tc(query, gate, blocks, lengths, table, cache, starts):
     )
 
 
-def _choose(ids, lengths, starts, offset, size, num_tiles, dtype):
+def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype):
     local = jnp.clip(starts - offset, 0, size)
     aligned = jnp.all((local[:-1] % 256 == 0) | (jnp.diff(local) == 0))
     # A boundary inside a TC tile changes the padded schedule; its fitted
@@ -219,12 +236,16 @@ def _choose(ids, lengths, starts, offset, size, num_tiles, dtype):
 def _one_chunk(arrays, cache, starts):
     q, gate, blocks, lengths, table = arrays
     num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
-    if tc_always_wins(queries=len(q), num_tiles=num_tiles, dtype=cache.dtype):
+    if tc_selected_by_static_bound(
+        queries=len(q), num_tiles=num_tiles, dtype=cache.dtype
+    ):
         return _tc(q, gate, blocks, lengths, table, cache, starts), cache
-    choose = _choose(blocks, lengths, starts, 0, len(q), num_tiles, cache.dtype)
+    choose = _select_sc_for_chunk(
+        blocks, lengths, starts, 0, len(q), num_tiles, cache.dtype
+    )
 
     def sc(_):
-        return _sc_prefill(
+        output, _ = _sc_prefill(
             q,
             gate,
             blocks,
@@ -232,7 +253,8 @@ def _one_chunk(arrays, cache, starts):
             table,
             cache,
             chunk_size=SC_CHUNK_SIZE[jnp.dtype(cache.dtype)],
-        )[0]
+        )
+        return output
 
     return lax.cond(
         choose, sc, lambda _: _tc(q, gate, blocks, lengths, table, cache, starts), None
@@ -247,7 +269,7 @@ def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=Fa
         def direct(output):
             if tail:
                 padding = (-size) % 256
-                ys = tuple(
+                chunk_arrays = tuple(
                     jnp.pad(
                         x[offset:],
                         ((0, padding),) + ((0, 0),) * (x.ndim - 1),
@@ -256,8 +278,11 @@ def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=Fa
                     for i, x in enumerate(arrays)
                 )
             else:
-                ys = tuple(lax.dynamic_slice_in_dim(x, offset, size) for x in arrays)
-            result = _direct_tc(ys[0], ys[1], ys[2], ys[3], ys[4], cache)[:size]
+                chunk_arrays = tuple(
+                    lax.dynamic_slice_in_dim(x, offset, size) for x in arrays
+                )
+            query, gate, blocks, lengths, table = chunk_arrays
+            result = _direct_tc(query, gate, blocks, lengths, table, cache)[:size]
             return lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
 
         # Align only one request-local Q256 tile directly into the final
@@ -275,13 +300,15 @@ def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=Fa
 
         def micro(i, output):
             start = offset + i * chunk
-            ys = tuple(lax.dynamic_slice_in_dim(x, start, chunk) for x in arrays)
+            query, gate, blocks, lengths, table = tuple(
+                lax.dynamic_slice_in_dim(x, start, chunk) for x in arrays
+            )
             result, _ = sc_grouped_attention(
-                ys[0],
-                ys[1],
-                ys[2],
-                ys[3],
-                ys[4],
+                query,
+                gate,
+                blocks,
+                lengths,
+                table,
                 cache,
                 kv_heads=2,
                 ratio=4,
@@ -295,7 +322,7 @@ def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=Fa
         if tail and size % chunk:
             live = size % chunk
             start = offset + size - live
-            ys = tuple(
+            query, gate, blocks, lengths, table = tuple(
                 jnp.pad(
                     x[start:],
                     ((0, chunk - live),) + ((0, 0),) * (x.ndim - 1),
@@ -304,11 +331,11 @@ def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=Fa
                 for i, x in enumerate(arrays)
             )
             result, _ = sc_grouped_attention(
-                ys[0],
-                ys[1],
-                ys[2],
-                ys[3],
-                ys[4],
+                query,
+                gate,
+                blocks,
+                lengths,
+                table,
                 cache,
                 kv_heads=2,
                 ratio=4,
@@ -325,12 +352,13 @@ def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=Fa
 
 def _sc_prefill(q, gate, blocks, lengths, table, cache, *, chunk_size):
     def step(kv, inputs):
+        query, gate, blocks, lengths, table = inputs
         out, kv = sc_grouped_attention(
-            inputs[0],
-            inputs[1],
-            inputs[2],
-            inputs[3],
-            inputs[4],
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
             kv,
             kv_heads=2,
             ratio=4,
@@ -366,7 +394,27 @@ def is_supported_by_adaptive_prefill(
     v_scale: float,
 ) -> bool:
     """Static eligibility only; request metadata obeys qsa_attention's contract."""
-    if (
+    # Keep these stages consecutive: early failures must not inspect later inputs.
+    if not _has_tested_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
+        return False
+    if not _has_supported_cache_and_index_metadata(
+        query, blocks, lengths, table, cache, starts
+    ):
+        return False
+    if not _has_unit_scales(k_scale, v_scale):
+        return False
+    packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
+    if cache.shape[2:] != (4 // packing, packing, 256):
+        return False
+    info = pltpu.get_tpu_info()
+    return (
+        info.chip_version == pltpu.ChipVersion.TPU_7X and info.sparse_core is not None
+    )
+
+
+def _has_tested_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
+    """Check the query contract and tested geometry before request offsets."""
+    if (  # noqa: SIM103 - Keep one truth test per predicate.
         query.ndim != 3
         or query.shape[1:] != (24, 256)
         or not 1 <= query.shape[0] <= 262144
@@ -377,7 +425,17 @@ def is_supported_by_adaptive_prefill(
         or ratio != 4
         or starts.ndim != 1
         or starts.shape[0] < 2
-        or cache.ndim != 5
+    ):
+        return False
+    return True
+
+
+def _has_supported_cache_and_index_metadata(
+    query, blocks, lengths, table, cache, starts
+):
+    """Check cache layout and budget before inspecting index metadata."""
+    if (  # noqa: SIM103 - Keep one truth test per predicate.
+        cache.ndim != 5
         or cache.shape[0] == 0
         or cache.shape[1] != 1664
         or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
@@ -388,16 +446,18 @@ def is_supported_by_adaptive_prefill(
         or table.shape[0] != len(query)
         or not 1 <= table.shape[1] <= (262144 + 1663) // 1664
         or any(x.dtype != jnp.int32 for x in (blocks, lengths, table, starts))
-        or not isinstance(k_scale, (int, float))
+    ):
+        return False
+    return True
+
+
+def _has_unit_scales(k_scale, v_scale):
+    """Check both scale types before comparing their values."""
+    if (  # noqa: SIM103 - Keep one truth test per predicate.
+        not isinstance(k_scale, (int, float))
         or not isinstance(v_scale, (int, float))
         or k_scale != 1.0
         or v_scale != 1.0
     ):
         return False
-    packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
-    if cache.shape[2:] != (4 // packing, packing, 256):
-        return False
-    info = pltpu.get_tpu_info()
-    return (
-        info.chip_version == pltpu.ChipVersion.TPU_7X and info.sparse_core is not None
-    )
+    return True

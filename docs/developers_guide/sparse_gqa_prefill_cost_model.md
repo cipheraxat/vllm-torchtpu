@@ -26,6 +26,16 @@ Otherwise, keep TC.** For example, predicted times of 10 ms for TC and 9.9 ms
 for SC select TC; 10 ms and 9 ms select SC. These are illustrative numbers. The
 2% margin is a policy choice, not an error guarantee.
 
+## Reading the implementation
+
+- `cost_model.py`: coefficients and runtime estimates in milliseconds.
+- `selector.py`: ordered bounds and the TC/SC decision.
+- `adaptive.py`: chunk scheduling and execution of the chosen branch.
+
+The selector tries static bounds, full-row upper bounds, a sampled lower bound,
+a coarse upper bound, and finally exact counts. Each stage can stop the search.
+Sampling can select SC; it cannot establish that TC is preferable.
+
 ## Where the numbers come from
 
 | Kind of number | Examples | Meaning |

@@ -7,8 +7,8 @@ establish that every term is necessary or that the 2% margin is optimal.
 
 ## Formula and work counts
 
-See the [cost model source][ref-1] and [occupancy source][ref-2]. Predicted
-times are in milliseconds.
+See the [cost model source][ref-1], [selector source][selector], and
+[occupancy source][ref-2]. Predicted times are in milliseconds.
 
 ```text
 TC = a0 + a1 × Qtc + a2 × Qtc × W + a3 × V
@@ -204,3 +204,5 @@ does not package the historical TPU harness or claim a new hardware run.
 [ref-8]: ../../scripts/sparse_gqa_prefill_cost_model/validation/full-results.json
 [ref-9]: ../../scripts/sparse_gqa_prefill_cost_model/validation/context-edges-results.json
 [ref-10]: ../../scripts/sparse_gqa_prefill_cost_model/README.md
+
+[selector]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/selector.py

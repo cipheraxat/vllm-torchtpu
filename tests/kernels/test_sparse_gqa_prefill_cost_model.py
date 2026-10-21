@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 
 
 @pytest.mark.parametrize("fp8", [False, True])
