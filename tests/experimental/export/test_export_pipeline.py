@@ -877,6 +877,18 @@ class _FakeWorker:
         return self._code
 
 
+def test_main_rejects_data_parallelism_before_starting_workers(
+    tmp_path: Path,
+) -> None:
+    argv = ["--model", "m", "--output-dir", str(tmp_path), "--data-parallel-size", "8"]
+    with (
+        mock.patch.object(cli, "_launch_workers") as launch,
+        pytest.raises(NotImplementedError, match="dp=8 pp=1"),
+    ):
+        cli.main(argv)
+    launch.assert_not_called()
+
+
 def test_launch_workers_keeps_rank0_output(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
     with (

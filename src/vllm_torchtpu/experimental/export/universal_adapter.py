@@ -96,6 +96,21 @@ def _min_smem_page_size(
     return 1 << (min_page - 1).bit_length()
 
 
+def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
+    """Returns `(dp, pp)` after rejecting data or pipeline parallel sizes above 1.
+
+    Takes a `ParallelConfig` or the parsed CLI arguments.
+    """
+    dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
+    pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
+    if (dp_size, pp_size) != (1, 1):
+        raise NotImplementedError(
+            f"export supports only data/pipeline parallel size 1, got "
+            f"dp={dp_size} pp={pp_size}"
+        )
+    return dp_size, pp_size
+
+
 def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
     """Returns the local checkpoint directory for a path or a cached Hub repo id.
 
@@ -147,13 +162,7 @@ def build_export_config_from_vllm(
     )
 
     tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1) or 1)
-    dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
-    pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
-    if (dp_size, pp_size) != (1, 1):
-        raise NotImplementedError(
-            f"export supports only data/pipeline parallel size 1, got "
-            f"dp={dp_size} pp={pp_size}"
-        )
+    dp_size, pp_size = check_supported_parallelism(parallel_cfg)
 
     if target_tpu is None:
         with contextlib.suppress(Exception):

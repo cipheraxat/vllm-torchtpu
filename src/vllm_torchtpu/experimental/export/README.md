@@ -13,7 +13,7 @@ python -m vllm_torchtpu.experimental.export \
 ```
 
 The exporter loads dummy weights, so it reads only the checkpoint's config and
-tokenizer files. Data and pipeline parallel sizes must be 1.
+tokenizer files.
 
 ## Static parameters: pass them explicitly to match `vllm serve`
 

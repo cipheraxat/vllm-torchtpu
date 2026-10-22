@@ -194,6 +194,8 @@ def run_export_from_args(
     """Executes the AOT model export given parsed CLI arguments."""
     if vllm_config is None and model is None:
         vllm_config = create_vllm_config_from_args(args)
+    if vllm_config is not None:
+        universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
     # Load before building the export config: loading finalizes the KV block size.
     loaded_on_device = model is None
     if loaded_on_device:
@@ -305,6 +307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
+    # Reject before starting workers, each of which would load the model first.
+    universal_adapter.check_supported_parallelism(args)
     if args.export_worker:
         run_export_from_args(args)
         return 0
