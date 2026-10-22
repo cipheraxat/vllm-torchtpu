@@ -160,7 +160,7 @@ def _worker(tp, out):
                     table.get_parameter("weight_scale").data.fill_(0.25)
                 table.to("tpu")
                 table.finalize_weights()
-                assert table.table.numel() == 0
+                assert not hasattr(table, "table")
                 gather = torch.compile(
                     parallel.gather_ids, backend="tpu", fullgraph=True, dynamic=False
                 )

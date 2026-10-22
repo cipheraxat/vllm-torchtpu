@@ -93,9 +93,13 @@ def pooled_short_conv(
     state_len: int,
 ) -> tuple[jax.Array, jax.Array]:
     channels = x.shape[-1]
-    history = read_region(
-        pool, ids, elements=state_len * channels, dtype=jnp.bfloat16
-    ).reshape(len(ids), state_len, channels)
+    history = (
+        read_region(
+            pool, ids, elements=state_len * channels, dtype=jnp.bfloat16
+        ).reshape(len(ids), state_len, channels)
+        if state_len
+        else jnp.zeros((len(ids), 0, channels), jnp.bfloat16)
+    )
     active = (ids > 0) & (starts[1:] > starts[:-1])
     slots = jnp.where(active, jnp.arange(len(ids), dtype=jnp.int32), -1)
     output, updated = short_conv(
@@ -108,5 +112,8 @@ def pooled_short_conv(
         dilation=dilation,
         request_owned_history=True,
     )
-    pool = write_region(pool, updated.reshape(len(ids), -1), jnp.where(active, ids, 0))
+    if state_len:
+        pool = write_region(
+            pool, updated.reshape(len(ids), -1), jnp.where(active, ids, 0)
+        )
     return pool, output

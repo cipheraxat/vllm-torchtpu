@@ -696,6 +696,13 @@ def test_ple_storage_reuses_common_checkpoint_loader(
     )
     try:
         assert table.weight.is_meta == (storage == "shared")
+        if storage != "resident":
+            assert not isinstance(table, ResidentPLETable)
+            assert not hasattr(table, "local_rows")
+            assert not hasattr(table, "lookup_raw")
+            assert "table" not in dict(table.named_buffers())
+            with pytest.raises(NotImplementedError, match="host lookup boundary"):
+                table(torch.tensor([0]))
         weights = [
             (f"ngram_embedding.shard_{i}.weight", shard)
             for i, shard in enumerate(checkpoint.split(22))
@@ -796,8 +803,11 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         lambda: lambda raw, scale: raw.view(torch.bfloat16),
     )
 
-    def conv_bridge(dilation):
-        def run(x, weight, history, starts, slots, initial):
+    def conv_bridge(dilation, state_len):
+        def run(x, weight, pool, starts, slots, initial):
+            history = pool.reshape(pool.shape[0], -1)[
+                :, : state_len * x.shape[-1]
+            ].view(pool.shape[0], state_len, x.shape[-1])
             request, chunk = token_requests(starts, x.shape[0])
             windows = torch.where(
                 initial[:, None, None], history[slots.clamp_min(0)], 0
@@ -812,7 +822,7 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
 
         return run
 
-    monkeypatch.setattr(pooled_ple, "build_short_conv_op", conv_bridge)
+    monkeypatch.setattr(pooled_ple, "build_pooled_short_conv_op", conv_bridge)
     shared = (
         ple_storage.SharedPLEOptions(tmp_path, "layer", {"checkpoint": "fixture"}, 1)
         if storage == "shared"
@@ -835,8 +845,29 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
     full_table = weights.pop("ple_embedding.ngram_embedding.weight")
     for i, rows in enumerate(full_table.split(22)):
         weights[f"ple_embedding.ngram_embedding.shard_{i}.weight"] = rows
-    adapted.load_checkpoint(iter(weights.items()))
+    loader_type = pooled_ple.AutoWeightsLoader
+    constructions = []
+
+    def loader(module):
+        instance = loader_type(module)
+        constructions.append(instance)
+        return instance
+
+    monkeypatch.setattr(pooled_ple, "AutoWeightsLoader", loader)
+    keys = set(adapted.state_dict())
+    assert adapted._checkpoint_loader is None
+    for name, value in weights.items():
+        adapted.load_checkpoint(iter([(name, value)]))
+        assert len(constructions) == 1
+        assert constructions[0].ignore_unexpected_suffixes == [".bias"]
+    assert set(adapted.state_dict()) == keys
+    assert adapted._loaded == set(dict(adapted.named_parameters())) | {
+        "ple_embedding.layer_multipliers",
+        "ple_embedding.ngram_heads_offsets",
+        "ple_embedding.ngram_heads_vocab_sizes",
+    }
     adapted.finalize_weights()
+    assert adapted._checkpoint_loader is None
     monkeypatch.setattr(
         ple_offload,
         "get_forward_context",
@@ -846,7 +877,12 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         4, reference.conv_state_len, HC * HIDDEN, dtype=torch.bfloat16
     )
     history[1].fill_(4)  # A reused slot must ignore stale history on first prefill.
-    adapted.bind_history(history)
+    pool = torch.zeros((4, 128, 1, 2, 128), dtype=torch.bfloat16)
+    flat = pool.reshape(4, -1)
+    flat[:, : history[0].numel()] = history.reshape(4, -1)
+    history = flat[:, : history[0].numel()].view_as(history)
+    untouched = flat[:, history[0].numel() :].clone()
+    adapted.bind_pool(pool)
     contexts = torch.full((3, 2), _PLE["eos_token_id"], dtype=torch.int64)
     expected_history = history.clone()
     generator = torch.Generator(device="cpu").manual_seed(314)
@@ -878,5 +914,187 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
                 if slot > 0:
                     expected_history[slot] = next_windows[i]
             torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
+            torch.testing.assert_close(
+                flat[:, history[0].numel() :], untouched, rtol=0, atol=0
+            )
     if isinstance(adapted.storage, ple_storage.HostPLETable):
         adapted.storage.close()
+
+
+def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_host
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    for name in ("get_tp_group", "get_dp_group"):
+        monkeypatch.setattr(qwen4_model, name, lambda: group)
+    monkeypatch.setattr(
+        qwen4_model, "Qwen4ExpGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
+    )
+    monkeypatch.setattr(
+        qwen4_model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity()
+    )
+    monkeypatch.setattr(qwen4_model, "GatedResidual", lambda *a, **kw: nn.Identity())
+    monkeypatch.setattr(ple_host.tempfile, "gettempdir", lambda: str(tmp_path))
+    options = []
+
+    def shared(*args):
+        result = ple_host.shared_ple_options(*args)
+        options.append(result)
+        return result
+
+    monkeypatch.setattr(qwen4_model, "shared_ple_options", shared)
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(**dict(_PLE, ple_layer_ids=[1])),
+            _qwen4_exp_ple_host_launch=dict(instance="typed-fixture", participants=1),
+        ),
+        quant_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        additional_config={
+            "qwen4_exp": {
+                "engram_config": dict(
+                    cpu_offload=True,
+                    dp_shared_memory=True,
+                )
+            }
+        },
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = qwen4_model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
+    try:
+        table = layer.ple.storage
+        assert isinstance(table, HostPLETable)
+        assert isinstance(options[0], ple_host.SharedPLEOptions)
+        assert table._shared_options is options[0]
+        assert options[0].participants == 1
+        assert options[0].key == "typed-fixture/model.layers.0.ple/tp0"
+        assert (
+            cfg.compilation_config.static_forward_context["model.layers.0.ple"]
+            is layer.ple
+        )
+    finally:
+        layer.ple.storage.close()
+
+
+@pytest.mark.parametrize("host", [False, True], ids=["resident", "host"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("num_tokens", [0, 5], ids=["zero_tokens", "padding_only"])
+@pytest.mark.parametrize("across_dp", [False, True], ids=["local", "dp_peer"])
+def test_ple_zero_requests_keep_owner_collectives(
+    monkeypatch, host, fp8, num_tokens, across_dp
+):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload, pooled_ple
+    from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
+
+    _set_tp(monkeypatch, 0, 1)
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("empty local requests must not hash/decode/convolve")
+
+    class Group:
+        rank_in_group = 0
+
+        def __init__(self, name, size):
+            self.name, self.world_size = name, size
+
+        def all_gather(self, ids, dim):
+            calls.append("gather")
+            assert ids.shape == (num_tokens, 4) and bool((ids == -1).all())
+            # Peer rows must still be served by the local table owner.
+            return torch.cat((ids, torch.zeros_like(ids)), dim=dim)
+
+        def all_reduce(self, rows):
+            calls.append(self.name)
+            return rows
+
+    tp, dp = Group("tp", 1), Group("dp", 2 if across_dp else 1)
+    parallel = PLEParallel(tp, dp, embedding_across_dp=across_dp)
+    config = _text_config(
+        **dict(_PLE, ple_embedding_dtype="float8_e4m3fn" if fp8 else None)
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = pooled_ple.Qwen4ExpPooledPLE(
+            config,
+            0,
+            None,
+            "ple",
+            parallel=parallel,
+            table_group=Group("table", parallel.world_size),
+            cpu_offload=host,
+        )
+    # No weights are read on the empty branch except peer raw rows. Check that
+    # ownership work explicitly; normal loaded-layer math is tested above.
+    layer._finalized = True
+    layer._conv = forbidden
+    history = torch.full((2, *layer.state_shape), 7, dtype=torch.bfloat16)
+    layer.cache_owners = (history,)
+    before = history.clone()
+    monkeypatch.setattr(layer, "gated_values", forbidden)
+    monkeypatch.setattr(layer.storage, "decode", forbidden)
+    width = layer.storage.embedding_dim * 4
+    carrier = torch.int8 if fp8 else torch.int16
+
+    def lookup(ids):
+        calls.append("lookup")
+        assert across_dp and ids.shape == (2 * num_tokens, 4)
+        assert bool((ids[:num_tokens] == -1).all())
+        assert bool((ids[num_tokens:] == 0).all())
+        return (ids[:, :1] == 0).expand(-1, width).to(carrier).clone()
+
+    if host:
+        monkeypatch.setattr(layer.storage, "lookup_host", lookup)
+        monkeypatch.setattr(
+            ple_offload,
+            "get_forward_context",
+            lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+        )
+    else:
+        monkeypatch.setattr(layer.storage, "lookup_raw", lookup)
+    inputs = PLEInputs(
+        torch.zeros(num_tokens, dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.empty(0, 2, dtype=torch.int32),
+    )
+    gathered = layer._lookup_ids(inputs, torch.tensor(0))
+    assert gathered.shape == (dp.world_size * num_tokens, 4)
+    assert bool((gathered[:num_tokens] == -1).all())
+    calls.clear()
+    monkeypatch.setattr(layer.ple_embedding, "compute_ids", forbidden)
+    hidden = torch.full((num_tokens, HC * HIDDEN), 3, dtype=torch.bfloat16)
+    raw = layer.lookup_for_model(inputs, torch.tensor(0)) if host else None
+    if host:
+        assert raw.shape == (dp.world_size, num_tokens, width) and raw.dtype == carrier
+    result = layer.forward_with_history(
+        hidden,
+        inputs,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.bool),
+        torch.tensor(0),
+        raw,
+    )
+    assert result.shape == hidden.shape and result.dtype == hidden.dtype
+    assert bool((result == 0).all())
+    assert layer.cache_owners[0] is history and torch.equal(history, before)
+    assert calls == (["gather", "lookup", "dp", "tp"] if across_dp else ["tp"])
+    if not across_dp:
+        compiled = torch.compile(
+            layer.forward_with_history, backend="eager", fullgraph=True
+        )
+        actual = compiled(
+            hidden,
+            inputs,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.bool),
+            torch.tensor(0),
+            raw,
+        )
+        torch.testing.assert_close(actual, result, rtol=0, atol=0)
+        assert torch.equal(history, before)

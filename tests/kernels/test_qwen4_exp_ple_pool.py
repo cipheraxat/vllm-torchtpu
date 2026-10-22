@@ -435,3 +435,119 @@ def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
         rtol=0.05,
         atol=0.03,
     )
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("dilation", [1, 3])
+def test_pooled_ple_zero_history_traces_without_pool_access(fp8, dilation):
+    # eval_shape traces the real region path; no backend or DMA is required.
+    carrier = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
+    args = (
+        jax.ShapeDtypeStruct((8, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
+        jax.ShapeDtypeStruct((7, 64, 1, 4 if fp8 else 2, 256), carrier),
+        jax.ShapeDtypeStruct((4,), jnp.int32),
+        jax.ShapeDtypeStruct((3,), jnp.int32),
+        jax.ShapeDtypeStruct((3,), jnp.bool_),
+    )
+
+    def run(*values):
+        return pooled_short_conv(*values, dilation=dilation, state_len=0)
+
+    pool, output = jax.eval_shape(run, *args)
+    assert pool == args[2] and output == args[0]
+    graph = jax.make_jaxpr(run)(*args).jaxpr
+    assert graph.outvars[0] is graph.invars[2]
+    assert not any("pallas" in eq.primitive.name for eq in graph.eqns)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("kernel_size", [1, 4])
+def test_pooled_ple_history_matches_token_reference(fp8, kernel_size):
+    """Independent causal oracle with explicit BF16 pre/post-SiLU boundaries."""
+    rng = np.random.default_rng(1966)
+    channels, dilation = 128, 3
+    state_len = (kernel_size - 1) * dilation
+    carrier = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
+    packing = 4 if fp8 else 2
+    host_pool = np.arange(7 * 64 * packing * 256, dtype=np.uint8).reshape(
+        7, 64, 1, packing, 256
+    )
+    # Repeat byte patterns to fill BF16 carriers without changing their bits.
+    host_pool = np.resize(host_pool, host_pool.size * np.dtype(carrier).itemsize)
+    host_pool = host_pool.view(np.dtype(carrier)).reshape(7, 64, 1, packing, 256)
+    pool = jax.device_put(host_pool)
+    ids = jnp.asarray([3, 0, 5], jnp.int32)
+    history = np.asarray(rng.normal(0, 0.2, (3, state_len, channels)), jnp.bfloat16)
+    weight = np.asarray(rng.normal(0, 0.2, (channels, kernel_size)), jnp.bfloat16)
+    if state_len:
+        pool = jax.jit(write_region, donate_argnums=(0,))(
+            pool, jnp.asarray(history.reshape(3, -1)), ids
+        )
+    run = jax.jit(
+        pooled_short_conv,
+        donate_argnums=(2,),
+        static_argnames=("dilation", "state_len"),
+    )
+    for starts, initial in [
+        ([0, 3, 4, 6], [True, False, False]),
+        ([0, 2, 2, 4], [True, False, True]),
+    ]:
+        x = np.asarray(rng.normal(0, 0.2, (8, channels)), jnp.bfloat16)
+        before = np.asarray(pool).view(np.uint8).copy()
+        expected = np.zeros(x.shape, jnp.bfloat16)
+        next_history = history.copy()
+        for r, (start, stop) in enumerate(zip(starts[:-1], starts[1:])):
+            if r == 1 or stop == start:
+                continue
+            prefix = history[r] if initial[r] else np.zeros_like(history[r])
+            for t in range(start, stop):
+                accum = np.zeros(channels, np.float32)
+                for tap in range(kernel_size):
+                    relative = t - start - state_len + tap * dilation
+                    value = (
+                        x[start + relative]
+                        if relative >= 0
+                        else prefix[state_len + relative]
+                    )
+                    accum += value.astype(np.float32) * weight[:, tap].astype(
+                        np.float32
+                    )
+                pre = accum.astype(jnp.bfloat16).astype(np.float32)
+                expected[t] = (pre / (1 + np.exp(-pre))).astype(jnp.bfloat16)
+            if state_len:
+                next_history[r] = np.concatenate((prefix, x[start:stop]))[-state_len:]
+        pool, output = run(
+            jnp.asarray(x),
+            jnp.asarray(weight),
+            pool,
+            jnp.asarray(starts, jnp.int32),
+            ids,
+            jnp.asarray(initial),
+            dilation=dilation,
+            state_len=state_len,
+        )
+        np.testing.assert_allclose(
+            np.asarray(output, np.float32),
+            expected.astype(np.float32),
+            rtol=0.01,
+            atol=0.001,
+        )
+        after = np.asarray(pool).view(np.uint8)
+        if state_len:
+            restored = jax.jit(read_region, static_argnames=("elements", "dtype"))(
+                pool, ids, elements=state_len * channels, dtype=jnp.bfloat16
+            ).reshape(3, state_len, channels)
+            np.testing.assert_array_equal(
+                np.asarray(restored)[[0, 2]], next_history[[0, 2]]
+            )
+            np.testing.assert_array_equal(
+                after[[0, 1, 2, 4, 6]], before[[0, 1, 2, 4, 6]]
+            )
+            token_bytes = np.prod(pool.shape[2:]) * pool.dtype.itemsize
+            used = (state_len * channels * 2 + token_bytes - 1) // token_bytes
+            np.testing.assert_array_equal(after[:, used:], before[:, used:])
+        else:
+            np.testing.assert_array_equal(after, before)
+        history = next_history

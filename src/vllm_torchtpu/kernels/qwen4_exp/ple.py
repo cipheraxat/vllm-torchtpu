@@ -123,7 +123,8 @@ def short_conv(
     monotone starts in [0,T] and unique in-range slots; -1 denotes padded
     requests. Empty requests leave their slots untouched. Scratch is
     O(T*C + R*state_len*C), never R times the largest request length. History stores
-    normalized gated values, not convolution results.
+    normalized gated values, not convolution results. Output is already
+    SiLU-activated and rounded to BF16.
 
     Request-owned history uses identity slots for active requests. Its caller
     masks idle writes, so updated rows can be returned without a slot scatter.

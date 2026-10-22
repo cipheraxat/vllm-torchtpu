@@ -14,7 +14,6 @@
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
 from collections.abc import Iterable, Sequence
-from pathlib import Path
 from typing import cast
 
 import torch
@@ -44,7 +43,6 @@ from .parallel import PLEParallel
 from .ple import PLEInputs
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
-from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
@@ -84,13 +82,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
             if index + 1 in t.ple_layer_ids and engram.get("dp_shared_memory", False)
             else None
         )
-        if shared is not None:
-            shared = SharedPLEOptions(
-                directory=Path(shared["directory"]),
-                key=shared["key"],
-                identity=shared["identity"],
-                participants=shared["participants"],
-            )
         self.ple = (
             Qwen4ExpPooledPLE(
                 config=t,
