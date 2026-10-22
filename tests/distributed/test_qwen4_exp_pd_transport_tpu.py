@@ -308,7 +308,7 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
             "TPU_VISIBLE_DEVICES",
         ):
             os.environ.pop(key, None)
-        # Use the full runtime used by the successful multichip PLE test.
+        # Initialize the full native slice, including its keep-alive ranks.
         prepare_tpu_environment(world_size=8)
         launch_env = os.environ.copy()
     launch_env.update(

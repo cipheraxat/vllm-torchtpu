@@ -19,8 +19,8 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 
 HcPrefillMode = int | Literal["auto"]
 
-# Synchronized HC-only off/on measurements, not a universal size threshold:
-# https://github.com/vllm-project/vllm-torchtpu/pull/1961#issuecomment-6306985716
+# HC fusion needs enough token work to amortize launch and working-set costs.
+# This profitability policy does not replace resource or dtype admission.
 _MEASURED_HARDWARE = HcHardware("7x", 64 << 20, 128, 16, 8, 256)
 _MIX_TOKENS = (1024, 2048, 8192)
 _COMBINE_TOKENS = (1024, 2048, 8192)
