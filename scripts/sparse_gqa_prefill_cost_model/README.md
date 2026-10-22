@@ -31,5 +31,5 @@ inputs and are not required by the fitter. The exact historical TPU harness
 is not packaged here. Use `scripts/benchmark_qsa_prefill.py` for current
 repository kernels; this CLI does not regenerate the historical samples.
 
-[guide]: ../../docs/developers_guide/sparse_gqa_prefill_cost_model.md
+[guide]: ../../docs/developers_guide/sparse_gqa_prefill.md#cost-and-choice
 [archive]: https://github.com/vllm-project/vllm-torchtpu/tree/b56b6ec6928edef4972793d4651e84454938d927/scripts/sparse_gqa_prefill_cost_model
