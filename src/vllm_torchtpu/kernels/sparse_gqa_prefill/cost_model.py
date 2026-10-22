@@ -42,7 +42,7 @@ class PrefillCostModel(NamedTuple):
     sc_attention_tile_ms: float
 
 
-# Filled once from the frozen calibration set, before held-out validation.
+# Calibrated coefficients convert the schedule's work counts to milliseconds.
 COST_MODELS: dict[jnp.dtype, PrefillCostModel] = {
     jnp.dtype(jnp.bfloat16): PrefillCostModel(
         0.25000650408450037,
