@@ -16,6 +16,7 @@
 import pytest
 
 from tests.models.vllm.test_qwen4_exp_parallel import config
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.qwen4_exp.config import (
     require_unified_pool,
     validate_config,
@@ -232,7 +233,8 @@ def test_qwen4_pool_opt_out_fails_before_adapter_construction(monkeypatch):
 def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
     from types import SimpleNamespace
 
-    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    # Override even a materialized lazy env attribute, then restore its absence.
+    monkeypatch.setitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
     cfg = config()
     cfg.cache_config.cache_dtype = "fp8"
     cfg.cache_config.mamba_ssm_cache_dtype = ssm_dtype
@@ -242,6 +244,16 @@ def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
         kv_role=role,
     )
     validate_config(cfg)
+    for transport in ("", "zmq"):
+        with monkeypatch.context() as patch:
+            patch.setitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", transport)
+            with pytest.raises(ValueError, match="model-owned Raiden connector"):
+                validate_config(cfg)
+    for admission in ("QWEN35", "KIMIK3", "GLM", "DSV4"):
+        with monkeypatch.context() as patch:
+            patch.setitem(vars(envs), f"TPU_RAIDEN_{admission}_ADMISSION", True)
+            with pytest.raises(ValueError, match="model-owned Raiden connector"):
+                validate_config(cfg)
     for section, field, value in [
         ("parallel_config", "tensor_parallel_size", 2),
         ("parallel_config", "data_parallel_size", 4),
