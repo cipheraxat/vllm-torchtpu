@@ -190,6 +190,9 @@ def run_export_from_args(
     """Executes the AOT model export given parsed CLI arguments."""
     if vllm_config is None and model is None:
         vllm_config = create_vllm_config_from_args(args)
+    # Load before building the export config: loading finalizes the KV block size.
+    if model is None:
+        model = universal_adapter.load_dummy_vllm_model(vllm_config)
 
     token_buckets = _parse_int_list(getattr(args, "token_buckets", None))
     req_buckets = _parse_int_list(getattr(args, "req_buckets", None))

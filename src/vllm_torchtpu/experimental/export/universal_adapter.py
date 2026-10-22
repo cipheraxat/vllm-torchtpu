@@ -368,6 +368,12 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
                 vllm_config=vllm_config,
                 model_config=vllm_config.model_config,
             )
+            # Same step vLLM's executors run right after `load_model`: it picks
+            # the KV block size from the model's attention backend, which serving
+            # uses and which keeps the block table within SMEM.
+            from vllm.platforms import current_platform
+
+            current_platform.update_block_size_for_backend(vllm_config)
 
             with contextlib.suppress(Exception):
                 from vllm_torchtpu.layers.adapter.attention import (
@@ -416,6 +422,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 "UniversalVllmExportableLLM requires either `model` or `vllm_config`"
             )
         self._vllm_config = vllm_config
+        # Load first: loading finalizes `cache_config.block_size`.
+        if model is None:
+            model = load_dummy_vllm_model(vllm_config)
         if export_config is None:
             if vllm_config is None:
                 raise ValueError(
@@ -423,8 +432,6 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 )
             export_config = build_export_config_from_vllm(vllm_config)
         self._export_config = export_config
-        if model is None:
-            model = load_dummy_vllm_model(vllm_config)
         self._model = model
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
             self._model
