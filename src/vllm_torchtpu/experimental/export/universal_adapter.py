@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import math
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -462,6 +463,63 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     @property
     def export_config(self) -> api.TextOnlyLLMExportConfig:
         return self._export_config
+
+    def fit_num_blocks_to_hbm(
+        self,
+        gpu_memory_utilization: float,
+        kv_cache_memory_bytes: int | None = None,
+        devices: Sequence[Any] | None = None,
+    ) -> int:
+        """Sets `num_blocks` to the KV blocks that fit this rank's KV budget.
+
+        Same budget as `TPUWorker.determine_available_memory`: `kv_cache_memory_bytes`
+        when given, otherwise the HBM limit of `devices` (default: this rank's TPU)
+        times `gpu_memory_utilization`, minus the HBM already in use (the loaded
+        model). Export runs no profile pass, so activation scratch has to fit in the
+        headroom `gpu_memory_utilization` leaves. Collective: rank 0's artifact
+        serves every rank, so all ranks take the minimum.
+        """
+        from vllm_torchtpu import utils
+
+        if kv_cache_memory_bytes:
+            available = kv_cache_memory_bytes
+            limit_msg = f"--kv-cache-memory-bytes {kv_cache_memory_bytes}"
+        else:
+            if devices is None:
+                devices = [torch.device("tpu")]
+            budget = utils.compute_hbm_budget(devices, gpu_memory_utilization)
+            available = budget.available
+            limit_msg = (
+                f"{budget.total_used} bytes in use of {budget.cap} allowed by "
+                f"--gpu-memory-utilization {gpu_memory_utilization} "
+                f"({budget.total_limit} bytes total)"
+            )
+        num_blocks = self._export_config.num_blocks
+        kv_bytes = sum(
+            math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
+            for s in self.abstract_states()
+        )
+        fitted = max(available, 0) * num_blocks // kv_bytes
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            from vllm.distributed import get_world_group
+
+            t = torch.tensor([fitted], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                t, op=torch.distributed.ReduceOp.MIN, group=get_world_group().cpu_group
+            )
+            fitted = int(t.item())
+        if fitted < 1:
+            raise ValueError(
+                f"no KV cache block ({kv_bytes // num_blocks} bytes) fits in the KV "
+                f"budget: {limit_msg}; raise the budget or pass --num-blocks"
+            )
+        self._export_config = dataclasses.replace(
+            self._export_config, num_blocks=fitted
+        )
+        return fitted
 
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
         """Builds abstract specs for the model's parameters and buffers.
