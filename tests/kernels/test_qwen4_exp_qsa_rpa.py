@@ -267,7 +267,9 @@ def _check_lifecycle(
         )
         actual_pooled = native_fn(
             *native_producer,
-            *(jnp.array(x, copy=True) for x in state),
+            # These owners are independent of the reference and donated once.
+            # Numerical BF16 copies can flush the opaque integer tag planes.
+            *state,
             *native_metadata,
         )
         decoded = unpack_state(*actual_pooled[:2], compressed_shape, ring_shape)
@@ -415,5 +417,31 @@ def test_dual_store_fixture_lane_words_match_mosaic(fp8, index_dim, ratio):
         np.asarray(actual).reshape(2, -1)[:, :16], np.asarray(tags).reshape(2, -1)
     )
     assert state[0].dtype == main.dtype and state[1].dtype == jnp.bfloat16
+    np.testing.assert_array_equal(state[0][0], 0)
+    np.testing.assert_array_equal(state[1][0], 0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_dual_store_fixture_preserves_opaque_tag_bits(fp8):
+    """Validate host packing and native transfer against original integer words."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_state import read_ring_and_tags
+
+    main = jnp.ones(
+        (2, 128, 1, 4 if fp8 else 2, 128), jnp.float8_e4m3fn if fp8 else jnp.bfloat16
+    )
+    keys = jnp.zeros((2, 32, 1, 128), jnp.bfloat16)
+    ring = jnp.ones((3, 8, 128), jnp.bfloat16)
+    words = np.array(
+        [0, 1, 125, 127, 128, 65535, 65536, 0x1234567, -1, -7, -(2**31), 2**31 - 1],
+        np.int32,
+    )
+    tags = np.resize(words, (3, 8, 2))
+    state, ids = pack_state(main, keys, ring, tags)
+    restored = unpack_state(*state, keys.shape, ring.shape)
+    for actual, expected in zip(restored, (main, keys, ring, tags)):
+        np.testing.assert_array_equal(actual, expected)
+    _, device_tags = read_ring_and_tags(state[1], jnp.asarray(ids), 8 * 128, 8 * 2)
+    np.testing.assert_array_equal(np.asarray(device_tags).reshape(tags.shape), tags)
     np.testing.assert_array_equal(state[0][0], 0)
     np.testing.assert_array_equal(state[1][0], 0)

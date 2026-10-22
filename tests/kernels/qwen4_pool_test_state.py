@@ -15,9 +15,33 @@
 
 import math
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from jax.experimental import pallas as pl
+
+
+def _upload_index(index: np.ndarray) -> jax.Array:
+    """Transfer opaque tag planes without BF16 numerical materialization."""
+    if jax.default_backend() == "cpu":
+        return jnp.asarray(index)
+    shape = index.shape
+    planes = index.view(np.uint16).reshape(*shape[:-2], 1, 2, shape[-1])
+    words = planes[..., 0, :].astype(np.uint32) | (
+        planes[..., 1, :].astype(np.uint32) << 16
+    )
+
+    def kernel(source, target):
+        target.bitcast(jnp.uint32)[...] = source[...]
+
+    return pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec((1, *words.shape[1:]), lambda i: (i, 0, 0, 0, 0))],
+        out_specs=pl.BlockSpec((1, *shape[1:]), lambda i: (i, 0, 0, 0, 0)),
+        grid=(shape[0],),
+        out_shape=jax.ShapeDtypeStruct(shape, jnp.bfloat16),
+    )(jnp.asarray(words))
 
 
 def pack_state(main, compressed, ring, tags):
@@ -55,7 +79,7 @@ def pack_state(main, compressed, ring, tags):
     main_pool = jnp.pad(main, ((1, 0),) + ((0, 0),) * (main.ndim - 1))
     return (
         main_pool,
-        jnp.asarray(index.reshape(len(index), rows // 2, 1, 2, width)),
+        _upload_index(index.reshape(len(index), rows // 2, 1, 2, width)),
     ), np.arange(pages + 1, pages + slots + 1, dtype=np.int32)
 
 
