@@ -160,7 +160,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 dict[str, AttentionMetadata], get_forward_context().attn_metadata
             )
             ple_slots = per_layer[self.ple.prefix].mamba_state_indices
-            assert ple_slots is not None
+            assert isinstance(ple_slots, torch.Tensor)
             hidden = hidden + self.ple.forward_with_history(
                 hidden,
                 PLEInputs(input_ids, query_start_loc, ngram_context),
