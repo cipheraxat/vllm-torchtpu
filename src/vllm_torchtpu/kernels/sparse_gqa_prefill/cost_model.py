@@ -38,7 +38,7 @@ class PrefillCostModel(NamedTuple):
     sc_attention_tile_ms: float
 
 
-# Frozen fit and feature units: docs/developers_guide/sparse_gqa_prefill_cost_model.md
+# Calibrated coefficients convert the schedule's work counts to milliseconds.
 COST_MODELS: dict[jnp.dtype, PrefillCostModel] = {
     jnp.dtype(jnp.bfloat16): PrefillCostModel(
         tc_fixed_ms=0.25000650408450037,
