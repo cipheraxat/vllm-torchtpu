@@ -24,7 +24,6 @@ from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_pooled_short_conv_op,
-    build_short_conv_op,
 )
 
 from .parallel import PLEParallel
@@ -105,14 +104,6 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             raise ValueError(f"Missing PLE checkpoint tensors: {sorted(missing)}")
         self.storage.finalize_weights()
         self._finalized = True
-
-    def bind_history(self, history: torch.Tensor) -> None:
-        if history.ndim != 3 or history.shape[1:] != self.state_shape:
-            raise ValueError(f"PLE history must have shape [slots,{self.state_shape}]")
-        if history.dtype != torch.bfloat16:
-            raise ValueError("PLE history must use BF16")
-        self.cache_owners = (history,)
-        self._conv = build_short_conv_op(self.conv_dilation)
 
     def bind_pool(self, pool: torch.Tensor) -> None:
         self.cache_owners = (pool,)
